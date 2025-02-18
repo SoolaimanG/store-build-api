@@ -183,7 +183,7 @@ export const doesEmailOrStoreExist = async (req: Request, res: Response) => {
     };
 
     if (checkFor === "email") {
-      const user = await findUser({ email });
+      const user = await findUser({ email }, false);
       return res.status(200).json(
         httpStatusResponse(200, "User is found on our database.", {
           isExisting: !!user,
@@ -232,6 +232,12 @@ export const verifyAccountNumber = async (req: Request, res: Response) => {
     console.log(err);
     return res.status(500).json(httpStatusResponse(500, err.message));
   }
+};
+
+export const welcomeHome = async (req: Request, res: Response) => {
+  return res
+    .status(200)
+    .json(httpStatusResponse(200, "Welcome to Store Build"));
 };
 
 // This Routes Are For Store Owners

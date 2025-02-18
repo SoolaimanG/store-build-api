@@ -57,6 +57,7 @@ import {
   verifyAccountNumber,
   verifySubscription,
   verifyToken,
+  welcomeHome,
   writeReviewOnProdcut,
 } from "./controllers";
 import {
@@ -280,6 +281,8 @@ router.post(
   checkIfUserIsAuthenticated,
   createDeliveryPickupForOrder
 );
+
+router.get("/", welcomeHome);
 
 export default (): express.Router => {
   return router;

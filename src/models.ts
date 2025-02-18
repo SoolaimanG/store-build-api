@@ -12,6 +12,7 @@ import {
   IProduct,
   IRating,
   IReferral,
+  ISection,
   IStore,
   IStoreHeroSection,
   IStoreSettings,
@@ -106,17 +107,47 @@ UserSchema.post("save", async function (doc) {
     try {
       const store = await findStore({ owner: doc._id });
 
+      const section: ISection = {
+        display: "flex",
+        header: "For You!",
+        products: "random",
+      };
+      const theme = store.customizations.theme || themes[0];
+
+      store.customizations.theme = theme;
+      store.customizations.category.showImage = false;
+      store.sections = Boolean(store.sections.length)
+        ? store.sections
+        : [section];
+
+      const storeProducts = await ProductModel.find({
+        isActive: true,
+        storeId: store._id,
+      }).countDocuments();
+
+      const isFirstTimer = Boolean(
+        doc.isEmailVerified && doc.phoneNumber && storeProducts
+      );
+
+      doc.firstTimeUser = !isFirstTimer;
+
+      // To switch user from being a first-timer, make sure that the user have add a product, phone number and also verify their email address
+
       await Promise.all([
         handleIntegrationConnection(store._id, "paystack"),
         handleIntegrationConnection(store._id, "sendbox"),
+        store.save({ validateModifiedOnly: true }),
+        doc.save({ validateModifiedOnly: true }),
       ]);
-    } catch (error) {}
+    } catch (error) {
+      console.log(error);
+    }
 
     if (doc.isEmailVerified) {
       const email = generateWelcomeEmail({ userName: doc.fullName });
 
-      await sendEmail(doc.email, email, undefined, "Welcome To Store Build");
       // Trigger a welcome email to the user
+      await sendEmail(doc.email, email, undefined, "Welcome To Store Build");
     }
   }
 });
@@ -250,7 +281,33 @@ export const StoreSchema: mongoose.Schema<IStore> = new mongoose.Schema(
       index: true,
       path: "user",
     },
-    isActive: { type: Boolean, default: true },
+    isActive: {
+      type: Boolean,
+      default: true,
+      validate: {
+        async validator(isActive: boolean) {
+          if (!isActive) return true;
+          // For a store to be active, the store must have atleast one product, the owner of the store verify the email and add a phone number.
+
+          const user = await findUser(this.owner);
+
+          const storeHasProduct = await ProductModel.find({
+            isActive: true,
+            storeId: this._id,
+          });
+
+          if (!storeHasProduct.length) return false;
+
+          if (!user.isEmailVerified) return false;
+
+          if (!user.phoneNumber) return false;
+
+          return true;
+        },
+        message:
+          "For store active and available to the public, Add atleast one product, verify your email address and add your phone number",
+      },
+    },
     balance: { type: Number, default: 0, select: false },
     paymentDetails: {
       type: StorePaymentDetailsSchema,
@@ -321,9 +378,21 @@ export const StoreSchema: mongoose.Schema<IStore> = new mongoose.Schema(
           type: Boolean,
           default: false,
           validate: {
-            validator(showImage: boolean) {
+            async validator(showImage: boolean) {
               if (!showImage) return;
+
+              const categories = await CategoryModel.find({
+                storeId: this._id,
+              });
+
+              const doesAllCategoriesHaveImage = categories.every((category) =>
+                category.img.startsWith("https")
+              );
+
+              return doesAllCategoriesHaveImage;
             },
+            message:
+              "If show image is turn on, then all categories must have images in them.",
           },
         },
         icon: { type: String },
@@ -416,7 +485,7 @@ export const SubscriptionSchema = new mongoose.Schema<ISubscription>(
 SubscriptionSchema.post("save", async function (doc) {
   if (doc.status === "paid") {
     const user = await findUser(doc.user, true, { plan: 1 });
-    const store = await StoreModel.findOne({ owner: user._id });
+    const store = await findStore({ owner: user._id }, true, { storeName: 1 });
 
     await sendEmail(
       user.email,

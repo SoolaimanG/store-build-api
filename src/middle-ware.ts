@@ -94,7 +94,7 @@ export const errorMiddleWare = (
       .status(error.errorCode || 500)
       .json(
         httpStatusResponse(
-          error.errorCode,
+          error.errorCode || 500,
           error.message || "Something went wrong with our server"
         )
       );

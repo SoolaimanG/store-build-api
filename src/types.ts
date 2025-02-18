@@ -95,7 +95,7 @@ export type IStoreFeatures = {
 };
 
 export type ISection = {
-  _id: string;
+  _id?: string;
   header: string;
   products: IProductToShow;
   display: IDisplay;
@@ -579,7 +579,7 @@ export type IDeliveryIntegration = {
   selectedStates?: string[];
 };
 
-export type IUserActions = "ADD_PRODUCT" | "UPLOAD_VIDEO";
+export type IUserActions = "ADD_PRODUCT" | "UPLOAD_VIDEO" | "USE_AI";
 
 export type IMediaIntegration = {
   images: "1" | "2" | "3";

@@ -510,7 +510,7 @@ export const validateOrderCreation = async (
 export const verifyOtp = async (token: string, userEmail: string) => {
   const email = { $regex: userEmail, $options: "i" };
 
-  const user = await UserModel.findOne({ email });
+  const user = await findUser({ email });
 
   // Find and delete OTP in one query
   const otp = await OTPModel.findOne({ token, user: user.id });
