@@ -7,6 +7,7 @@ import {
   _sendOTP,
   _sendQuickEmail,
   addOrEditStoreAddress,
+  aiStoreAssistant,
   calculateProductPrice,
   completeOrderPayment,
   connectAndDisconnectIntegration,
@@ -15,6 +16,7 @@ import {
   createDeliveryPickupForOrder,
   createOrder,
   createOrEditProduct,
+  customerAiChat,
   deleteCategory,
   deleteCoupon,
   deleteProduct,
@@ -24,6 +26,8 @@ import {
   editDeliveryAddress,
   editOrder,
   editStore,
+  exportCustomerData,
+  getAiConversation,
   getCategories,
   getCoupon,
   getCoupons,
@@ -43,20 +47,26 @@ import {
   getProductTypes,
   getProductWithIds,
   getQuickEmails,
+  getReferrals,
   getSalesChartData,
   getStore,
   getStoreAddresses,
   getThemes,
+  getTutorial,
   getUser,
+  hasFinishedTutorialVideo,
   initiateChargeForSubscription,
   joinNewsLetter,
   manageIntegration,
+  markTutorialAsCompleted,
   requestCancelOrder,
   requestConfirmationOnOrder,
   signUp,
+  updateUser,
   verifyAccountNumber,
   verifySubscription,
   verifyToken,
+  watchTutorial,
   welcomeHome,
   writeReviewOnProdcut,
 } from "./controllers";
@@ -280,6 +290,42 @@ router.post(
   "/create-delivery-pickup/:orderId",
   checkIfUserIsAuthenticated,
   createDeliveryPickupForOrder
+);
+
+router.patch("/update-user/", checkIfUserIsAuthenticated, updateUser);
+
+router.get(`/get-referrals/`, checkIfUserIsAuthenticated, getReferrals);
+
+router.post(
+  "/mark-tutorial-as-completed/",
+  checkIfUserIsAuthenticated,
+  markTutorialAsCompleted
+);
+
+router.get("/get-tutorial/:videoId/", checkIfUserIsAuthenticated, getTutorial);
+
+router.post(`/watch-tutorial/`, checkIfUserIsAuthenticated, watchTutorial);
+
+router.get(
+  "/has-finished-tutorial-videos/",
+  checkIfUserIsAuthenticated,
+  hasFinishedTutorialVideo
+);
+
+router.post(
+  "/export-customers-data/",
+  checkIfUserIsAuthenticated,
+  exportCustomerData
+);
+
+router.post("/customer-ai-chat/:storeId/", customerAiChat);
+
+router.get("/get-ai-conversation/", passUserIfAuthenticated, getAiConversation);
+
+router.post(
+  "/ai-store-assistant/",
+  checkIfUserIsAuthenticated,
+  aiStoreAssistant
 );
 
 router.get("/", welcomeHome);

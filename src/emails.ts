@@ -1,5 +1,13 @@
 import dotenv from "dotenv";
-import { ICustomerAddress, IOrder, IOrderStatus, PATHS } from "./types";
+import {
+  ICustomerAddress,
+  IOrder,
+  IOrderProduct,
+  IOrderStatus,
+  IPaymentDetails,
+  IProduct,
+  PATHS,
+} from "./types";
 import { formatAmountToNaira } from "./helper";
 import { format } from "date-fns";
 import { config } from "./constant";
@@ -1353,4 +1361,395 @@ export function generateWelcomeEmail({
   `;
 }
 
-export { EmailType, generateEmail };
+function generateOrderEmailWithPaymentLink({
+  items,
+  totalAmount,
+  paymentLink,
+  viewOrderLink,
+  userName,
+  orderNumber,
+}: {
+  items: IOrderProduct[];
+  totalAmount: number;
+  paymentLink: string;
+  viewOrderLink: string;
+  userName: string;
+  orderNumber: string;
+}) {
+  const itemsHtml = items
+    .map(
+      (item) => `
+        <tr>
+          <td>${item.productName}</td>
+          <td>${item.quantity}</td>
+          <td>₦${item.discount || item.price.default}</td>
+        </tr>
+      `
+    )
+    .join("");
+
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            body {
+                font-family: 'Space Grotesk', Arial, sans-serif;
+                background-color: #f5f5f5;
+                margin: 0;
+                padding: 0;
+            }
+            .email-container {
+                max-width: 600px;
+                margin: 20px auto;
+                background-color: #ffffff;
+                border-radius: 10px;
+                box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+                overflow: hidden;
+            }
+            .header {
+                background-color: #6a0dad;
+                color: #ffffff;
+                text-align: center;
+                padding: 20px;
+            }
+            .header h1 {
+                margin: 0;
+                font-size: 24px;
+            }
+            .content {
+                padding: 20px;
+                color: #333333;
+                line-height: 1.6;
+            }
+            .content h2 {
+                color: #6a0dad;
+            }
+            .order-items {
+                margin-top: 20px;
+                border-collapse: collapse;
+                width: 100%;
+            }
+            .order-items th, .order-items td {
+                border: 1px solid #ddd;
+                padding: 8px;
+                text-align: left;
+            }
+            .order-items th {
+                background-color: #f3e5f5;
+                color: #6a0dad;
+            }
+            .order-items td {
+                color: #333333;
+            }
+            .button-container {
+                text-align: center;
+                margin-top: 20px;
+            }
+            .button {
+                display: inline-block;
+                margin: 10px;
+                padding: 10px 20px;
+                background-color: #6a0dad;
+                color: #ffffff;
+                text-decoration: none;
+                font-weight: bold;
+                border-radius: 5px;
+            }
+            .button:hover {
+                background-color: #540c9e;
+            }
+            .footer {
+                background-color: #6a0dad;
+                color: #ffffff;
+                text-align: center;
+                padding: 10px;
+                font-size: 14px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="email-container">
+            <!-- Header -->
+            <div class="header">
+                <h1>Order Received!</h1>
+            </div>
+            
+            <!-- Content -->
+            <div class="content">
+                <h2>Hello ${userName},</h2>
+                <p>Thank you for placing your order with us! We're excited to confirm that we've received it.</p>
+                <p>Your order number is: <strong>#${orderNumber}</strong></p>
+                
+                <!-- Order Items -->
+                <h3>Order Items:</h3>
+                <table class="order-items">
+                    <thead>
+                        <tr>
+                            <th>Item</th>
+                            <th>Quantity</th>
+                            <th>Price</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${itemsHtml}
+                        <tr>
+                            <td><strong>Total</strong></td>
+                            <td></td>
+                            <td><strong>₦${totalAmount}</strong></td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <!-- Buttons -->
+                <div class="button-container">
+                    <a href="${paymentLink}" class="button">Make Payment</a>
+                    <a href="${viewOrderLink}" class="button">View Order</a>
+                </div>
+            </div>
+
+            <!-- Footer -->
+            <div class="footer">
+                <p>Thank you for shopping with us! If you have any questions, feel free to contact us.</p>
+            </div>
+        </div>
+    </body>
+    </html>
+  `;
+}
+
+function generateManualPaymentEmail({
+  items,
+  totalAmount,
+  paymentDetails,
+  viewOrderLink,
+  userName,
+  orderNumber,
+}: {
+  items: IOrderProduct[];
+  totalAmount: number;
+  paymentDetails: IPaymentDetails;
+  viewOrderLink: string;
+  userName: string;
+  orderNumber: string;
+}) {
+  const itemsHtml = items
+    .map(
+      (item) => `
+        <tr>
+          <td>${item.productName}</td>
+          <td>${item.quantity}</td>
+          <td>₦${item.price}</td>
+        </tr>
+      `
+    )
+    .join("");
+
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            body {
+                font-family: 'Space Grotesk', Arial, sans-serif;
+                background-color: #f5f5f5;
+                margin: 0;
+                padding: 0;
+            }
+            .email-container {
+                max-width: 600px;
+                margin: 20px auto;
+                background-color: #ffffff;
+                border-radius: 10px;
+                box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+                overflow: hidden;
+            }
+            .header {
+                background-color: #6a0dad;
+                color: #ffffff;
+                text-align: center;
+                padding: 20px;
+            }
+            .header h1 {
+                margin: 0;
+                font-size: 24px;
+            }
+            .content {
+                padding: 20px;
+                color: #333333;
+                line-height: 1.6;
+            }
+            .content h2 {
+                color: #6a0dad;
+            }
+            .order-items {
+                margin-top: 20px;
+                border-collapse: collapse;
+                width: 100%;
+            }
+            .order-items th, .order-items td {
+                border: 1px solid #ddd;
+                padding: 8px;
+                text-align: left;
+            }
+            .order-items th {
+                background-color: #f3e5f5;
+                color: #6a0dad;
+            }
+            .order-items td {
+                color: #333333;
+            }
+            .button-container {
+                text-align: center;
+                margin-top: 20px;
+            }
+            .button {
+                display: inline-block;
+                margin: 10px;
+                padding: 10px 20px;
+                background-color: #6a0dad;
+                color: #ffffff;
+                text-decoration: none;
+                font-weight: bold;
+                border-radius: 5px;
+            }
+            .button:hover {
+                background-color: #540c9e;
+            }
+            .footer {
+                background-color: #6a0dad;
+                color: #ffffff;
+                text-align: center;
+                padding: 10px;
+                font-size: 14px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="email-container">
+            <!-- Header -->
+            <div class="header">
+                <h1>Order Received!</h1>
+            </div>
+            
+            <!-- Content -->
+            <div class="content">
+                <h2>Hello ${userName},</h2>
+                <p>Thank you for placing your order with us! We're excited to confirm that we've received it.</p>
+                <p>Your order number is: <strong>#${orderNumber}</strong></p>
+                
+                <!-- Order Items -->
+                <h3>Order Items:</h3>
+                <table class="order-items">
+                    <thead>
+                        <tr>
+                            <th>Item</th>
+                            <th>Quantity</th>
+                            <th>Price</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${itemsHtml}
+                        <tr>
+                            <td><strong>Total</strong></td>
+                            <td></td>
+                            <td><strong>₦${totalAmount}</strong></td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <!-- Payment Details -->
+                <h3>Payment Details:</h3>
+                <p>Please make a manual payment using the following details:</p>
+                <ul>
+                    <li><strong>Account Name:</strong> ${paymentDetails.accountName}</li>
+                    <li><strong>Account Number:</strong> ${paymentDetails.accountNumber}</li>
+                    <li><strong>Bank Name:</strong> ${paymentDetails.bankName}</li>
+                </ul>
+
+                <!-- Buttons -->
+                <div class="button-container">
+                    <a href="${viewOrderLink}" class="button">View Order</a>
+                </div>
+            </div>
+
+            <!-- Footer -->
+            <div class="footer">
+                <p>Thank you for shopping with us! If you have any questions, feel free to contact us.</p>
+            </div>
+        </div>
+    </body>
+    </html>
+  `;
+}
+
+function generateAdminOrderNotificationEmail({
+  adminName,
+  customerName,
+  orderNumber,
+  totalAmount,
+  items,
+  viewOrderLink,
+}: {
+  adminName: string;
+  customerName: string;
+  orderNumber: string;
+  totalAmount: number;
+  items: IOrderProduct[];
+  viewOrderLink: string;
+}) {
+  const itemsHtml = items
+    .map(
+      (item) => `
+        <tr>
+          <td style="padding: 8px 10px;">${item.productName}</td>
+          <td style="padding: 8px 10px; text-align: right;">${
+            item.quantity
+          }</td>
+          <td style="padding: 8px 10px; text-align: right;">₦${item.price.toLocaleString()}</td>
+        </tr>
+      `
+    )
+    .join("");
+
+  return `
+    <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: auto; border: 1px solid #ddd; border-radius: 8px; overflow: hidden;">
+      <div style="background-color: #4a148c; color: white; padding: 20px; text-align: center;">
+        <h1 style="margin: 0;">New Order Received</h1>
+      </div>
+      <div style="padding: 20px;">
+        <p>Hi ${adminName},</p>
+        <p>You have received a new order from <strong>${customerName}</strong>.</p>
+        <p><strong>Order Number:</strong> #${orderNumber}</p>
+        <p><strong>Total Amount:</strong> ₦${totalAmount.toLocaleString()}</p>
+        <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+          <thead>
+            <tr style="background-color: #f4f4f4; text-align: left;">
+              <th style="padding: 8px 10px;">Item</th>
+              <th style="padding: 8px 10px; text-align: right;">Quantity</th>
+              <th style="padding: 8px 10px; text-align: right;">Price</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${itemsHtml}
+          </tbody>
+        </table>
+        <p style="margin-top: 20px;">Click the button below to view the full order details:</p>
+        <a href="${viewOrderLink}" style="display: inline-block; background-color: #4a148c; color: white; text-decoration: none; padding: 10px 20px; border-radius: 4px; margin-top: 10px;">
+          View Order
+        </a>
+      </div>
+      <div style="background-color: #f4f4f4; padding: 10px; text-align: center; font-size: 14px; color: #666;">
+        This is an automated email. Please do not reply.
+      </div>
+    </div>
+  `;
+}
+
+export {
+  EmailType,
+  generateEmail,
+  generateOrderEmailWithPaymentLink,
+  generateManualPaymentEmail,
+  generateAdminOrderNotificationEmail,
+};

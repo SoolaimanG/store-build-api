@@ -1,3 +1,4 @@
+import { FunctionDeclaration } from "@google/generative-ai";
 import { themes } from "constant";
 import mongoose, { Document } from "mongoose";
 
@@ -52,6 +53,8 @@ export type IUser = {
   isEmailVerified: boolean;
   referralCode: string;
   paymentOnHold: boolean;
+  welcomeEmailSent?: boolean;
+  tutorialVideoWatch?: boolean;
 } & ITimeStamp;
 
 export type IOTP = {
@@ -138,6 +141,7 @@ export type IStore = {
   owner: string;
   isActive: boolean;
   paymentDetails?: IPaymentDetails;
+  previewFor?: string;
   customizations?: {
     logoUrl: string;
     theme?: IStoreTheme;
@@ -318,6 +322,18 @@ export type IOrderPaymentDetails = {
   paymentDate?: string; // Date and time of payment
   paymentLink?: string;
   tx_ref?: string;
+};
+
+export type ITutorial = {
+  _id?: string;
+  title: string;
+  description: string;
+  category: string;
+  isCompleted?: boolean;
+  user: string;
+  rating: number;
+  videoId?: string;
+  type: "video" | "image";
 };
 
 export type ICustomerAddress = {
@@ -563,13 +579,13 @@ export type IPaymentIntegration = {
 };
 
 export type IChatBotIntegrationPermissions = {
-  products: boolean;
-  orders: boolean;
-  customers: boolean;
+  allowProductAccess: boolean;
+  allowOrderAccess: boolean;
+  allowCustomerAccess: boolean;
 };
 
 export type IChatBotIntegration = {
-  chatBotName: string;
+  name: string;
   language: "en";
   permissions: IChatBotIntegrationPermissions;
 };
@@ -588,13 +604,15 @@ export type IMediaIntegration = {
 export type IntegrationProps = {
   isConnected: boolean;
   name: string;
-  settings: Record<
-    string,
+  settings:
     | IChatBotIntegration
     | IDeliveryIntegration
     | IMediaIntegration
-    | IPaymentIntegration
-  >;
+    | IPaymentIntegration;
+  apiKeys?: {
+    accessKey?: string;
+    token?: string;
+  };
 };
 
 export type Integration = {
@@ -940,3 +958,41 @@ export type PickUpCreationResponse = {
   quantity: number;
   total_value: number;
 };
+
+export type ITransaction = {
+  txRef: string;
+  paymentMethod: string;
+  amount: number;
+  paymentStatus: string;
+  paymentFor: string;
+} & ITimeStamp;
+
+// StoreBuild AI Configs
+
+export interface AIActions<T = any> {
+  name: string;
+  arguments: T;
+  description: string;
+}
+
+export type StoreActions = {
+  role: "admin" | "user";
+  actions: FunctionDeclaration[];
+};
+
+export interface Metadata {
+  tokensUsed?: number;
+  model?: string;
+  confidenceScore?: number;
+}
+
+export interface IChatBotConversation extends ITimeStamp {
+  _id?: string;
+  userPrompt?: string;
+  aiResponse?: string;
+  userId: string;
+  sessionId: string;
+  actionPerformed?: string;
+  intent?: string;
+  metadata?: Metadata;
+}

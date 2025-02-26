@@ -1,7 +1,7 @@
 // authMiddleware.ts
 import jwt from "jsonwebtoken";
 import { Request, Response, NextFunction } from "express";
-import { httpStatusResponse, isStoreActive, verifyStore } from "./helper";
+import { findStore, httpStatusResponse, verifyStore } from "./helper";
 
 const secret = process.env.SESSION_SECRET || "";
 
@@ -36,7 +36,16 @@ export const checkIfUserIsAuthenticated = (
       next();
     });
   } else {
-    res.status(401).json({ message: "Unauthorized" });
+    res
+      .status(401)
+      .json(
+        httpStatusResponse(
+          4400,
+          "Unauthorize Request: Please Login In",
+          undefined,
+          "unauthorize"
+        )
+      );
   }
 };
 
@@ -100,5 +109,23 @@ export const errorMiddleWare = (
       );
   } catch (error) {
     next(error);
+  }
+};
+
+export const allowActiveStore = async (
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const store = await findStore(req.storeId, true, { isActive: 1 });
+
+    if (!store.isActive) {
+      return res
+        .status(403)
+        .json(httpStatusResponse(403, "Store is not active."));
+    }
+  } catch (error) {
+    console.log(error);
   }
 };

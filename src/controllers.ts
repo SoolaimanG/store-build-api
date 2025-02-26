@@ -29,12 +29,11 @@ import {
   handleIntegrationConnection,
   handleReferralLogic,
   httpStatusResponse,
-  isStoreActive,
   processOrder,
-  queryRegex,
   sendEmail,
   sendOTP,
   sendQuickEmail,
+  StoreBuildAI,
   validateIconExistance,
   validateProduct,
   validateSignUpInput,
@@ -56,6 +55,8 @@ import {
   StoreModel,
   StoreSttings,
   SubscriptionModel,
+  TransactionModel,
+  TutorialModel,
   UserModel,
 } from "./models";
 import {
@@ -63,7 +64,6 @@ import {
   Customer,
   CustomerStats,
   GetCustomersQuery,
-  GetCustomersResponse,
   ICheckFor,
   ICoupon,
   ICustomer,
@@ -77,13 +77,16 @@ import {
   IProduct,
   IRating,
   IStore,
+  ITutorial,
+  IUser,
   SignUpBody,
 } from "./types";
 import { AuthenticatedRequest } from "./middle-ware";
 import { addDays, format, isAfter } from "date-fns";
 import mongoose, { PipelineStage } from "mongoose";
 import { EmailType, generateEmail, paymentDetailsAddedEmail } from "./emails";
-import { config, integrationIds, quickEmails, themes } from "./constant";
+import { config, quickEmails, referralPipeLine, themes } from "./constant";
+import ExcelJS from "exceljs";
 
 export const joinNewsLetter = async (req: Request, res: Response) => {
   try {
@@ -246,6 +249,9 @@ export const verifySubscription = async (
   res: Response
 ) => {
   try {
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
     const { query } = req;
 
     const { tx_ref } = query as unknown as {
@@ -256,6 +262,8 @@ export const verifySubscription = async (
     const trxAlreadyVerified = await SubscriptionModel.findOne({ tx_ref });
 
     if (!trxAlreadyVerified || trxAlreadyVerified.status === "paid") {
+      await session.abortTransaction();
+      session.endSession();
       return res
         .status(400)
         .json(
@@ -266,12 +274,24 @@ export const verifySubscription = async (
         );
     }
 
-    const response = await _verifyTransaction<{
-      userId: string;
-      autoRenew: boolean;
-    }>(tx_ref);
+    let response, user;
 
-    const user = await findUser(response.data.data.metadata.userId);
+    try {
+      response = await _verifyTransaction<{
+        userId: string;
+        autoRenew: boolean;
+      }>(tx_ref);
+    } catch (error) {
+      await session.abortTransaction();
+      session.endSession();
+    }
+
+    try {
+      user = await findUser(response.data.data.metadata.userId);
+    } catch {
+      await session.abortTransaction();
+      session.endSession();
+    }
 
     const { data } = response.data;
 
@@ -296,14 +316,32 @@ export const verifySubscription = async (
 
     // Update the user's plan
     user.plan = plan;
-    await user.save();
+    await user.save({ session });
 
-    await SubscriptionModel.create({
-      amountPaid: plan.amountPaid,
-      paymentType: data.channel,
-      tx_ref,
-      user: user._id,
-    });
+    await SubscriptionModel.create(
+      [
+        {
+          amountPaid: plan.amountPaid,
+          paymentType: data.channel,
+          tx_ref,
+          user: user._id,
+        },
+      ],
+      { session }
+    );
+
+    await TransactionModel.create(
+      [
+        {
+          amount: amountPaid,
+          paymentFor: "subcriptionPayment",
+          paymentMethod: response.data.data.channel,
+          paymentStatus: response.data.data.status,
+          txRef: user.id,
+        },
+      ],
+      { session }
+    );
 
     return res
       .status(200)
@@ -366,7 +404,7 @@ export const initiateChargeForSubscription = async (
 export const verifyToken = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { otp, email } = req.body;
-    const userEmail = req.userEmail;
+    const { userEmail } = req;
 
     const message = await verifyOtp(otp, userEmail || email);
 
@@ -408,8 +446,9 @@ export const getUser = async (req: AuthenticatedRequest, res: Response) => {
         isActive: 1,
         paymentDetails: 1,
         storeCode: 1,
+        balance: 1,
       }
-    );
+    ).select("+balance");
 
     return res.status(200).json(
       httpStatusResponse(200, "User retrieved successfully", {
@@ -927,8 +966,6 @@ export const createOrEditProduct = async (
     const { body, storeId, userId } = req;
     let product = body as IProduct;
 
-    isStoreActive(storeId);
-
     // Check for existing product in a single query
     const existingProduct = await ProductModel.findById(product._id);
 
@@ -949,6 +986,7 @@ export const createOrEditProduct = async (
         storeId,
       });
     } else {
+      checkMembershipAccess(userId, "ADD_PRODUCT", storeId);
       product = await _createProduct({
         ...product,
         _id: undefined,
@@ -1639,7 +1677,7 @@ export const getCustomers = async (
       limit = 10,
       filter,
     } = req.query as GetCustomersQuery;
-    const storeId = req.storeId;
+    const { storeId } = req;
 
     const skip = (Number(page) - 1) * Number(limit);
 
@@ -1891,23 +1929,48 @@ export const editStore = async (req: AuthenticatedRequest, res: Response) => {
 
 export const getStore = async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { storeId, query } = req;
+    const { storeId, query, userId } = req;
     const { storeCode } = query;
+    let beActive = false;
 
     let store: IStore | null = null;
 
     if (storeCode) {
-      const _store = await findStore({ storeCode });
+      const _store = await findStore({ storeCode }, false);
       store = _store?.toObject();
+
+      // Validate if the store preview time is still active or has expired
+      const now = new Date();
+      const previewTime = new Date(store.previewFor);
+
+      const isActive = Boolean(!store.isActive && userId);
+
+      if (now > previewTime && isActive) {
+        return res
+          .status(400)
+          .json(
+            httpStatusResponse(
+              3300,
+              "Preview time has been exceeded, if you are the store owner please click the link below."
+            )
+          );
+      }
+
+      beActive = isActive;
     } else {
       const _store = await StoreModel.findById(storeId).select(
         "+paymentDetails +balance"
       );
 
       store = _store?.toObject();
+      beActive = true;
     }
 
-    if (!store) return res.status(400).json(httpStatusResponse(400));
+    if (!beActive) {
+      return res
+        .status(400)
+        .json(httpStatusResponse(1100, "Store is not active."));
+    }
 
     return res.status(200).json(httpStatusResponse(200, undefined, store));
   } catch (error) {
@@ -2500,6 +2563,371 @@ export const createDeliveryPickupForOrder = async (
       .json(httpStatusResponse(200, "Order PickUp Created Successfully"));
   } catch (error) {
     // console.log(error);
+    const err = error as Error;
+    return res.status(500).json(httpStatusResponse(500, err.message));
+  }
+};
+
+export const updateUser = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { userId, body } = req;
+    const { fullName, email, phoneNumber, tutorialVideoWatch } = body;
+
+    const user = await findUser({ _id: userId });
+
+    user.fullName = fullName || user.fullName;
+    user.email = email || user.email;
+    user.phoneNumber = phoneNumber || user.phoneNumber;
+    user.tutorialVideoWatch = tutorialVideoWatch || user.tutorialVideoWatch;
+
+    const newUser = await user.save({ validateBeforeSave: true });
+
+    return res
+      .status(200)
+      .json(
+        httpStatusResponse(
+          200,
+          "Your profile has been updated successfully",
+          newUser
+        )
+      );
+  } catch (error) {
+    console.log(error);
+    const err = error as Error;
+    return res.status(500).json(httpStatusResponse(500, err.message));
+  }
+};
+
+export const getReferrals = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { userId } = req;
+
+    const result = await ReferralModel.aggregate(referralPipeLine(userId));
+
+    // Handle case when no referrals exist
+    const response = result[0] || {
+      totalReferrals: 0,
+      totalEarnings: 0,
+      referrals: [],
+    };
+
+    return res
+      .status(200)
+      .json(
+        httpStatusResponse(200, "Referrals retrieved successfully", response)
+      );
+  } catch (error) {
+    console.log(error);
+    const err = error as Error;
+    return res.status(500).json(httpStatusResponse(500, err.message));
+  }
+};
+
+export const markTutorialAsCompleted = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { userId } = req;
+
+    const body = req.body as ITutorial[];
+
+    const tutorials = body.map((tutorial) => {
+      const { _id, ...rest } = tutorial;
+      return {
+        ...rest,
+        user: userId,
+        isCompleted: true,
+        videoId: _id,
+      };
+    });
+
+    const newTutorials = await TutorialModel.create(tutorials);
+
+    return res
+      .status(200)
+      .json(
+        httpStatusResponse(
+          200,
+          "Tutorials have been marked as completed.",
+          newTutorials
+        )
+      );
+  } catch (error) {
+    console.error("Error marking tutorials as completed:", error);
+    const err = error as Error;
+    return res.status(500).json(httpStatusResponse(500, err.message));
+  }
+};
+
+export const getTutorial = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { userId } = req;
+    const { videoId } = req.params;
+
+    const tutorial = await TutorialModel.findOne({ user: userId, videoId });
+
+    return res.status(200).json(httpStatusResponse(200, undefined, tutorial));
+  } catch (error) {
+    console.log(error);
+    const err = error as Error;
+    return res.status(500).json(httpStatusResponse(500, err.message));
+  }
+};
+
+export const watchTutorial = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { userId } = req;
+    let nextVideo = 0;
+
+    const TUTORIAL_VIDEO_SIZE = 12;
+
+    const _ = await TutorialModel.countDocuments({ user: userId });
+
+    nextVideo = _ + 1;
+
+    if (_ >= TUTORIAL_VIDEO_SIZE) {
+      nextVideo = null;
+    }
+
+    return res.status(200).json(httpStatusResponse(200, undefined, nextVideo));
+  } catch (error) {
+    const err = error as Error;
+    return res.status(500).json(httpStatusResponse(500, err.message));
+  }
+};
+
+export const hasFinishedTutorialVideo = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { userId } = req;
+    const TUTORIAL_VIDEO_SIZE = 12;
+
+    const tutorialsWatched = await TutorialModel.countDocuments({
+      user: userId,
+      isCompleted: true,
+    });
+
+    return res
+      .status(200)
+      .json(
+        httpStatusResponse(
+          200,
+          undefined,
+          tutorialsWatched >= TUTORIAL_VIDEO_SIZE
+        )
+      );
+  } catch (error) {
+    console.log(error);
+    const err = error as Error;
+    return res.status(500).json(httpStatusResponse(500, err.message));
+  }
+};
+
+export const exportCustomerData = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { body, storeId } = req;
+    const {
+      from,
+      to,
+      type = "excel",
+    } = body as {
+      from?: string;
+      to?: string;
+      type?: "excel" | "json";
+    };
+
+    if (!storeId) {
+      return res
+        .status(400)
+        .json(httpStatusResponse(400, "Store ID is required."));
+    }
+
+    if (!from || !to || isNaN(Date.parse(from)) || isNaN(Date.parse(to))) {
+      return res
+        .status(400)
+        .json(httpStatusResponse(400, "Invalid date range provided."));
+    }
+
+    const fromDate = new Date(from);
+    const toDate = new Date(to);
+
+    const pipeline: PipelineStage[] = [
+      {
+        $match: {
+          storeId,
+          createdAt: { $gte: fromDate, $lte: toDate },
+        },
+      },
+      {
+        $group: {
+          _id: "$customerDetails.email",
+          name: { $first: "$customerDetails.name" },
+          email: { $first: "$customerDetails.email" },
+          amountSpent: { $sum: "$amountPaid" },
+          itemsBought: {
+            $sum: {
+              $cond: [
+                { $eq: ["$orderStatus", "Completed"] },
+                { $size: "$products" },
+                0,
+              ],
+            },
+          },
+          lastPurchase: { $max: "$updatedAt" },
+          orderCount: { $sum: 1 },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          id: "$_id",
+          name: 1,
+          email: 1,
+          amountSpent: 1,
+          itemsBought: 1,
+          lastPurchase: 1,
+          averageOrderValue: { $divide: ["$amountSpent", "$orderCount"] },
+        },
+      },
+    ];
+
+    const customers = await OrderModel.aggregate(pipeline);
+
+    if (!customers.length) {
+      return res
+        .status(204)
+        .json(httpStatusResponse(204, "No customers to export."));
+    }
+
+    if (type === "excel") {
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet("Customers");
+
+      worksheet.columns = [
+        { header: "ID", key: "id", width: 20 },
+        { header: "Name", key: "name", width: 25 },
+        { header: "Email", key: "email", width: 30 },
+        { header: "Amount Spent", key: "amountSpent", width: 15 },
+        { header: "Items Bought", key: "itemsBought", width: 15 },
+        { header: "Average Order Value", key: "averageOrderValue", width: 20 },
+        { header: "Last Purchase", key: "lastPurchase", width: 20 },
+      ];
+
+      customers.forEach((customer) => worksheet.addRow(customer));
+
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      );
+      res.setHeader(
+        "Content-Disposition",
+        'attachment; filename="customers.xlsx"'
+      );
+
+      await workbook.xlsx.write(res);
+      return res.end();
+    } else if (type === "json") {
+      res.setHeader("Content-Type", "application/json");
+      res.setHeader(
+        "Content-Disposition",
+        'attachment; filename="customers.json"'
+      );
+
+      return res.status(200).send(customers);
+    } else {
+      return res
+        .status(400)
+        .json(httpStatusResponse(400, "Invalid export type specified."));
+    }
+  } catch (error) {
+    console.error("Export Customer Data Error:", error);
+    const err = error as Error;
+    return res.status(500).json(httpStatusResponse(500, err.message));
+  }
+};
+
+export const getAiConversation = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { storeId: sId, userId: uId } = req;
+    const {
+      storeId: _sId,
+      userId: _uId,
+      sessionId,
+    } = req.query as {
+      storeId?: string;
+      userId?: string;
+      sessionId?: string;
+    };
+
+    const ai = new StoreBuildAI(
+      _sId || sId,
+      _uId || uId,
+      _uId || sessionId,
+      Boolean(sId)
+    );
+
+    const chats = await ai.getChatHistory();
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "Chats gotten successfully", chats));
+  } catch (error) {
+    const err = error as Error;
+    return res.status(500).json(httpStatusResponse(500, err.message));
+  }
+};
+
+export const customerAiChat = async (req: Request, res: Response) => {
+  try {
+    const { storeId } = req.params;
+
+    const { prompt, sessionId } = req.body as {
+      prompt: string;
+      sessionId: string;
+    };
+
+    const ai = new StoreBuildAI(storeId, sessionId, sessionId);
+
+    const r = await ai.customerHelper({ question: prompt });
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "response generated successfully.", r));
+  } catch (error) {
+    const err = error as Error;
+    return res.status(500).json(httpStatusResponse(500, err.message));
+  }
+};
+
+export const aiStoreAssistant = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { storeId, userId } = req;
+    const { query, sessionId } = req.body;
+
+    const ai = new StoreBuildAI(storeId, userId, sessionId, true);
+
+    const r = await ai.storeAssistant(query);
+
+    return res.status(200).json(httpStatusResponse(200, undefined, r));
+  } catch (error) {
     const err = error as Error;
     return res.status(500).json(httpStatusResponse(500, err.message));
   }
