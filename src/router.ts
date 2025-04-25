@@ -1,12 +1,14 @@
 import express from "express";
-import { body } from "express-validator";
+import { body, check } from "express-validator";
 import { validateRequest } from "./helper";
 import {
   _calculateDeliveryCost,
   _getBanks,
   _sendOTP,
   _sendQuickEmail,
+  _subscribeToChatBot,
   addOrEditStoreAddress,
+  addSendBoxApiKey,
   aiStoreAssistant,
   calculateProductPrice,
   completeOrderPayment,
@@ -20,14 +22,17 @@ import {
   deleteCategory,
   deleteCoupon,
   deleteProduct,
+  deleteSendBoxApiKey,
   deleteStoreAddress,
   doesEmailOrStoreExist,
   editCategory,
   editDeliveryAddress,
   editOrder,
+  editOrderForCustomer,
   editStore,
   exportCustomerData,
   getAiConversation,
+  getBanks,
   getCategories,
   getCoupon,
   getCoupons,
@@ -37,6 +42,8 @@ import {
   getDashboardContent,
   getIntegration,
   getIntegrations,
+  getInvoice,
+  getOnBoardingFlows,
   getOrder,
   getOrderMetrics,
   getOrders,
@@ -51,6 +58,7 @@ import {
   getSalesChartData,
   getStore,
   getStoreAddresses,
+  getStoreBank,
   getThemes,
   getTutorial,
   getUser,
@@ -59,6 +67,7 @@ import {
   joinNewsLetter,
   manageIntegration,
   markTutorialAsCompleted,
+  payWithBankAccount,
   requestCancelOrder,
   requestConfirmationOnOrder,
   signUp,
@@ -116,8 +125,6 @@ router.get(
   checkIfUserIsAuthenticated,
   verifySubscription
 );
-
-router.get("/get-banks/", _getBanks);
 
 router.get("/get-categories/:storeId/", getCategories);
 
@@ -198,7 +205,7 @@ router.post("/create-order/", passUserIfAuthenticated, createOrder);
 
 router.post("/calculate-products-price/", calculateProductPrice);
 
-router.get("/get-orders/:orderId/", passUserIfAuthenticated, getOrder);
+router.get("/get-orders/:orderId/", getOrder);
 
 router.patch("/edit-order/:orderId/", checkIfUserIsAuthenticated, editOrder);
 
@@ -327,6 +334,40 @@ router.post(
   checkIfUserIsAuthenticated,
   aiStoreAssistant
 );
+
+router.patch("/edit-order-for-customer/:orderId/", editOrderForCustomer);
+
+router.post(
+  "/subscribe-to-chat-bot/",
+  checkIfUserIsAuthenticated,
+  _subscribeToChatBot
+);
+
+router.get(
+  `/get-onboarding-flow/`,
+  checkIfUserIsAuthenticated,
+  getOnBoardingFlows
+);
+
+router.get("/get-banks/", checkIfUserIsAuthenticated, getBanks);
+
+router.get(`/get-store-bank/`, checkIfUserIsAuthenticated, getStoreBank);
+
+router.get(`/get-invoice/:invoiceId/`, checkIfUserIsAuthenticated, getInvoice);
+
+router.post(
+  "/add-send-box-api-key/",
+  checkIfUserIsAuthenticated,
+  addSendBoxApiKey
+);
+
+router.delete(
+  "/delete-send-box-api-keys/",
+  checkIfUserIsAuthenticated,
+  deleteSendBoxApiKey
+);
+
+router.post(`/pay-with-bank-account/`, payWithBankAccount);
 
 router.get("/", welcomeHome);
 

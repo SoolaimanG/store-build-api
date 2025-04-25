@@ -1746,10 +1746,290 @@ function generateAdminOrderNotificationEmail({
   `;
 }
 
+export type OrderItem = {
+  name: string;
+  quantity: number;
+  price: number;
+  imageUrl?: string;
+};
+
+export type OrderDetails = {
+  orderId: string;
+  customerName: string;
+  customerEmail: string;
+  items: OrderItem[];
+  total: number;
+  shippingAddress: {
+    street: string;
+    city: string;
+    state: string;
+    zipCode: string;
+    country: string;
+  };
+  shippingMethod: string;
+  estimatedDelivery?: string;
+  companyName?: string;
+  companyLogo?: string;
+  supportEmail?: string;
+  supportPhone?: string;
+};
+
+/**
+ * Generates an HTML email template for order completion notifications
+ * @param order The order details
+ * @returns HTML string for the email template
+ */
+function generateOrderCompletionEmail(order: OrderDetails): string {
+  const {
+    orderId,
+    customerName,
+    items,
+    total,
+    shippingAddress,
+    shippingMethod,
+    estimatedDelivery,
+    companyName = "Our Store",
+    companyLogo = "/images/logo.png",
+    supportEmail = "support@example.com",
+    supportPhone = "(555) 123-4567",
+  } = order;
+
+  const itemsHtml = items
+    .map(
+      (item) => `
+      <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">
+          ${
+            item.imageUrl
+              ? `<img src="${item.imageUrl}" alt="${item.name}" style="width: 50px; height: 50px; object-fit: cover; margin-right: 10px;" />`
+              : ""
+          }
+        </td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">
+          ${item.name}
+        </td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee; text-align: center;">
+          ${item.quantity}
+        </td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee; text-align: right;">
+          ${formatAmountToNaira(item.price)}
+        </td>
+      </tr>
+    `
+    )
+    .join("");
+
+  return `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Order Confirmation</title>
+    </head>
+    <body style="margin: 0; padding: 0; font-family: Arial, sans-serif; color: #333; background-color: #f7f7f7;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+        <tr>
+          <td style="padding: 20px 0; text-align: center; background-color: #ffffff; border-bottom: 1px solid #eee;">
+            <img src="${companyLogo}" alt="${companyName}" style="max-height: 50px; max-width: 200px;">
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 30px 20px; background-color: #ffffff;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+              <tr>
+                <td>
+                  <h1 style="margin: 0 0 20px; font-size: 24px; line-height: 1.2; color: #333;">Your Order is Complete!</h1>
+                  <p style="margin: 0 0 15px; font-size: 16px; line-height: 1.5;">Hello ${customerName},</p>
+                  <p style="margin: 0 0 15px; font-size: 16px; line-height: 1.5;">Thank you for your purchase. Your order has been successfully processed and is now complete.</p>
+                  <p style="margin: 0 0 25px; font-size: 16px; line-height: 1.5;">Here's a summary of your order:</p>
+                  
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-bottom: 25px; border-collapse: collapse;">
+                    <tr style="background-color: #f7f7f7; font-weight: bold;">
+                      <th style="padding: 10px; text-align: left; border-bottom: 2px solid #eee;" colspan="2">Item</th>
+                      <th style="padding: 10px; text-align: center; border-bottom: 2px solid #eee;">Qty</th>
+                      <th style="padding: 10px; text-align: right; border-bottom: 2px solid #eee;">Price</th>
+                    </tr>
+                    ${itemsHtml}
+                    <tr>
+                      <td colspan="3" style="padding: 10px; text-align: right; font-weight: bold;">Total:</td>
+                      <td style="padding: 10px; text-align: right; font-weight: bold;">${formatAmountToNaira(
+                        total
+                      )}</td>
+                    </tr>
+                  </table>
+                  
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-bottom: 25px;">
+                    <tr>
+                      <td width="50%" valign="top" style="padding-right: 10px;">
+                        <h2 style="margin: 0 0 10px; font-size: 18px; color: #333;">Order Information</h2>
+                        <p style="margin: 0 0 5px; font-size: 14px; line-height: 1.5;"><strong>Order ID:</strong> ${orderId}</p>
+                        <p style="margin: 0 0 5px; font-size: 14px; line-height: 1.5;"><strong>Shipping Method:</strong> ${shippingMethod}</p>
+                        ${
+                          estimatedDelivery
+                            ? `<p style="margin: 0 0 5px; font-size: 14px; line-height: 1.5;"><strong>Estimated Delivery:</strong> ${estimatedDelivery}</p>`
+                            : ""
+                        }
+                      </td>
+                      <td width="50%" valign="top" style="padding-left: 10px;">
+                        <h2 style="margin: 0 0 10px; font-size: 18px; color: #333;">Shipping Address</h2>
+                        <p style="margin: 0; font-size: 14px; line-height: 1.5;">
+                          ${shippingAddress.street}<br>
+                          ${shippingAddress.city}, ${shippingAddress.state} ${
+    shippingAddress.zipCode
+  }<br>
+                          ${shippingAddress.country}
+                        </p>
+                      </td>
+                    </tr>
+                  </table>
+                  
+                  <p style="margin: 0 0 15px; font-size: 16px; line-height: 1.5;">If you have any questions about your order, please contact our customer support team.</p>
+                  <p style="margin: 0 0 25px; font-size: 16px; line-height: 1.5;">Thank you for shopping with us!</p>
+                  
+                  <p style="margin: 0; font-size: 16px; line-height: 1.5;">Best regards,<br>The ${companyName} Team</p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 20px; text-align: center; background-color: #f7f7f7; border-top: 1px solid #eee;">
+            <p style="margin: 0 0 10px; font-size: 14px; line-height: 1.5; color: #666;">
+              Need help? Contact us at <a href="mailto:${supportEmail}" style="color: #0066cc; text-decoration: none;">${supportEmail}</a> 
+              or call us at ${supportPhone}
+            </p>
+            <p style="margin: 0; font-size: 12px; line-height: 1.5; color: #999;">
+              &copy; ${new Date().getFullYear()} ${companyName}. All rights reserved.
+            </p>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `;
+}
+
+type SubscriptionEmailProps = {
+  customerName: string;
+  subscriptionPlan: string;
+  startDate: string;
+  nextBillingDate: string;
+  amount: string;
+  companyName?: string;
+  companyLogo?: string;
+  contactEmail?: string;
+};
+
+function generateSubscriptionEmail({
+  customerName,
+  subscriptionPlan,
+  startDate,
+  nextBillingDate,
+  amount,
+  companyName = "Your Company",
+  companyLogo = "/placeholder.svg?height=60&width=200",
+  contactEmail = "support@example.com",
+}: SubscriptionEmailProps): string {
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Subscription Confirmation</title>
+    </head>
+    <body style="margin: 0; padding: 0; font-family: Arial, sans-serif; color: #333333; background-color: #f9f9f9;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+        <tr>
+          <td align="center" style="padding: 20px 0;">
+            <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+              <!-- Header with purple background -->
+              <tr>
+                <td style="background-color: #7e22ce; padding: 30px 40px; text-align: center;">
+                  <img src="${companyLogo}" alt="${companyName}" style="max-height: 60px; max-width: 200px;">
+                </td>
+              </tr>
+              
+              <!-- Main content -->
+              <tr>
+                <td style="padding: 40px;">
+                  <h1 style="margin: 0 0 20px; color: #7e22ce; font-size: 24px;">Subscription Confirmed!</h1>
+                  <p style="margin: 0 0 15px; font-size: 16px; line-height: 1.5;">Hello ${customerName},</p>
+                  <p style="margin: 0 0 25px; font-size: 16px; line-height: 1.5;">Thank you for your subscription. Your payment has been successfully processed.</p>
+                  
+                  <!-- Current subscription details -->
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-bottom: 30px; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden;">
+                    <tr>
+                      <td colspan="2" style="background-color: #f3e8ff; padding: 15px; border-bottom: 1px solid #e5e7eb;">
+                        <h2 style="margin: 0; color: #7e22ce; font-size: 18px;">Subscription Details</h2>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td style="padding: 15px; border-bottom: 1px solid #e5e7eb; width: 40%;">Plan</td>
+                      <td style="padding: 15px; border-bottom: 1px solid #e5e7eb; font-weight: bold;">${subscriptionPlan}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding: 15px; border-bottom: 1px solid #e5e7eb;">Start Date</td>
+                      <td style="padding: 15px; border-bottom: 1px solid #e5e7eb; font-weight: bold;">${startDate}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding: 15px; border-bottom: 1px solid #e5e7eb;">Amount</td>
+                      <td style="padding: 15px; border-bottom: 1px solid #e5e7eb; font-weight: bold;">${amount}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding: 15px;">Next Billing Date</td>
+                      <td style="padding: 15px; font-weight: bold;">${nextBillingDate}</td>
+                    </tr>
+                  </table>
+                  
+                  <!-- Next subscription info -->
+                  <div style="background-color: #f3e8ff; border-radius: 8px; padding: 25px; margin-bottom: 30px;">
+                    <h3 style="margin: 0 0 15px; color: #7e22ce; font-size: 18px;">Your Next Subscription</h3>
+                    <p style="margin: 0 0 15px; font-size: 16px; line-height: 1.5;">Your subscription will automatically renew on <strong>${nextBillingDate}</strong>. You will be charged <strong>${amount}</strong> for the next billing cycle.</p>
+                    <p style="margin: 0; font-size: 16px; line-height: 1.5;">You can manage your subscription anytime from your account dashboard.</p>
+                  </div>
+                  
+                  <!-- CTA Button -->
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-bottom: 30px;">
+                    <tr>
+                      <td align="center">
+                        <a href="#" style="display: inline-block; background-color: #7e22ce; color: #ffffff; text-decoration: none; font-weight: bold; padding: 15px 30px; border-radius: 6px; font-size: 16px;">Manage Subscription</a>
+                      </td>
+                    </tr>
+                  </table>
+                  
+                  <p style="margin: 0 0 15px; font-size: 16px; line-height: 1.5;">If you have any questions or need assistance, please contact our support team at <a href="mailto:${contactEmail}" style="color: #7e22ce; text-decoration: underline;">${contactEmail}</a>.</p>
+                  <p style="margin: 0; font-size: 16px; line-height: 1.5;">Thank you for choosing ${companyName}!</p>
+                </td>
+              </tr>
+              
+              <!-- Footer -->
+              <tr>
+                <td style="background-color: #f9f9f9; padding: 20px; text-align: center; font-size: 14px; color: #666666; border-top: 1px solid #e5e7eb;">
+                  <p style="margin: 0 0 10px;">&copy; ${new Date().getFullYear()} ${companyName}. All rights reserved.</p>
+                  <p style="margin: 0;">
+                    <a href="#" style="color: #7e22ce; text-decoration: underline; margin: 0 10px;">Privacy Policy</a>
+                    <a href="#" style="color: #7e22ce; text-decoration: underline; margin: 0 10px;">Terms of Service</a>
+                    <a href="#" style="color: #7e22ce; text-decoration: underline; margin: 0 10px;">Unsubscribe</a>
+                  </p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `;
+}
+
 export {
   EmailType,
   generateEmail,
   generateOrderEmailWithPaymentLink,
   generateManualPaymentEmail,
   generateAdminOrderNotificationEmail,
+  generateOrderCompletionEmail,
+  generateSubscriptionEmail,
 };

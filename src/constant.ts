@@ -154,6 +154,8 @@ export const config = {
   "X-RAPIDAPI-HOST": process.env["X-RAPIDAPI-HOST"],
   "X-RAPIDAPI-KEY": process.env["X-RAPIDAPI-KEY"],
   GOOGLE_GEMINI_API_KEY: process.env.GOOGLE_GEMINI_API_KEY,
+  TOTAL_CUSTOMER_CHAT: process.env.TOTAL_CUSTOMER_CHAT,
+  CHATBOT_SUBSCRIPTION_FEE: process.env.CHATBOT_SUBSCRIPTION_FEE,
 };
 
 export const referralPipeLine = (userId: string): PipelineStage[] => [

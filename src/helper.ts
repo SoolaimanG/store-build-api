@@ -1,13 +1,16 @@
-import mongoose, { PipelineStage } from "mongoose";
+import mongoose, { PipelineStage, Schema } from "mongoose";
 import {
+  budPayPayload,
   chargePayload,
   chargeResponse,
+  FlutterwaveResponse,
   IChatBotConversation,
   IChatBotIntegration,
   ICoupon,
   ICustomer,
   ICustomerAddress,
   IDiscoveredUsBy,
+  IIntegrationSubscription,
   IJoinNewsLetterFrom,
   IOrder,
   IOrderPaymentDetails,
@@ -23,29 +26,36 @@ import {
   IShippingDetails,
   IStore,
   IStoreTheme,
+  ITransaction,
   IUser,
   IUserActions,
   OrderQuery,
+  paymentAccountCreationProps,
   PickUpCreationResponse,
   ShipmentResponse,
   ShippingData,
   SignUpBody,
   StoreActions,
+  TransactionRequest,
   VerifyChargeResponse,
+  virtualAccountCreationProps,
 } from "./types";
 import {
   CategoryModel,
   ChatBotConversationModel,
   Coupon,
   IntegrationModel,
+  IntegrationSubscriptionModel,
   NewsLetterModel,
   OrderModel,
   OTPModel,
   ProductModel,
+  ProductTypesModel,
   RatingModel,
   ReferralModel,
   StoreModel,
   StoreSttings,
+  TransactionModel,
   UserModel,
 } from "./models";
 import { Request, Response, NextFunction } from "express";
@@ -75,7 +85,6 @@ import {
 import { validationResult } from "express-validator";
 import {
   Content,
-  FunctionCallingMode,
   FunctionDeclaration,
   GoogleGenerativeAI,
   SchemaType,
@@ -450,23 +459,23 @@ export const sendEmail = async (
 // Separate function to fetch integrations
 export const fetchIntegrations = async (storeId: string) => {
   enum Integration {
-    PAYSTACK = "paystack",
+    FLUTTERWAVE = "flutterwave",
     SENDBOX = "sendbox",
   }
 
   // Fetch both integrations in parallel
-  const [sendBoxIntegration, paystackIntegration] = await Promise.all([
+  const [sendBoxIntegration, flutterwaveIntegration] = await Promise.all([
     IntegrationModel.findOne({
       storeId,
       "integration.name": Integration.SENDBOX,
     }).lean(),
     IntegrationModel.findOne({
       storeId,
-      "integration.name": Integration.PAYSTACK,
+      "integration.name": Integration.FLUTTERWAVE,
     }).lean(),
   ]);
 
-  return { sendBoxIntegration, paystackIntegration };
+  return { sendBoxIntegration, flutterwaveIntegration };
 };
 
 // Handle notifications separately
@@ -483,8 +492,8 @@ export const handleOrderNotifications = async (
       {
         background: "#252525",
         text: "#fffff",
-        secondary: theme.secondary,
-        primary: theme.primary,
+        secondary: theme?.secondary || "",
+        primary: theme?.primary || "",
       }
     );
 
@@ -1024,27 +1033,25 @@ export const verifyIntegration = (integration: string) => {
     );
 };
 
-export async function createCharge(
-  paymentData: chargePayload
-): Promise<chargeResponse> {
+export async function createCharge({
+  currency = "NGN",
+  session_duration = 1440,
+  max_retry_attempt = 2,
+  ...props
+}: TransactionRequest) {
   try {
-    const response = await axios.post(
-      "https://api.paystack.co/transaction/initialize",
-      paymentData,
+    const res = await axios.post<FlutterwaveResponse>(
+      `https://api.flutterwave.com/v3/payments`,
+      { currency, session_duration, max_retry_attempt, ...props },
       {
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${config.PAYSTACK_SECRET}`,
+          Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`,
         },
       }
     );
 
-    return response.data;
-
-    // const data: FlutterwaveResponse = await response.json();
-    // return data;
+    return res.data;
   } catch (error) {
-    console.error("Error creating charge:", error);
     throw error;
   }
 }
@@ -1181,10 +1188,13 @@ export function formatAmountToNaira(amount: number) {
 export const isStoreActive = async (storeId: string) => {
   const store = await StoreModel.findById(storeId).lean();
 
-  if (!store.isActive)
+  if (!store.isActive) {
     throw new Error(
-      "Cannot proceed because your store is not active, please contact support"
+      "Cannot proceed because this store is not active, please contact support"
     );
+  }
+
+  return store;
 };
 
 export const areAllProductDigital = (products: IProduct[]) => {
@@ -1197,154 +1207,176 @@ export const processOrder = async (
   tx_ref: string,
   couponCode?: string
 ) => {
-  // Create a new ObjectId properly
-  const _id = new mongoose.Types.ObjectId();
+  try {
+    // Create a new ObjectId properly
+    const _id = new mongoose.Types.ObjectId();
 
-  isStoreActive(storeId);
+    await isStoreActive(storeId);
 
-  const customerDetails: ICustomer & { shippingAddress: ICustomerAddress } = {
-    ...order.customerDetails,
-    email: order.customerDetails.email,
-    name: order.customerDetails.name,
-    phoneNumber: order.customerDetails.phoneNumber,
-  };
-
-  const paymentDetails: IOrderPaymentDetails = {
-    paymentDate: new Date().toISOString(),
-    paymentLink: "NIL",
-    paymentMethod: "banktrf",
-    paymentStatus: "pending",
-    tx_ref,
-    transactionId: tx_ref,
-  };
-
-  const _products = order.products.map((p) => ({
-    size: p.size,
-    productId: p._id,
-    color: p.color,
-  }));
-
-  // Parallel execution of independent operations
-  const [amountRes, storeRes, integrationsRes] = await Promise.allSettled([
-    calculateTotalAmount(_products, couponCode),
-    validateOrderCreation(storeId, order),
-    fetchIntegrations(storeId),
-  ]);
-
-  const checkFulfilment =
-    amountRes.status === "rejected" ||
-    storeRes.status === "rejected" ||
-    integrationsRes.status === "rejected";
-
-  if (checkFulfilment) {
-    throw new Error("Something went wrong why trying to process your order");
-  }
-
-  const amount = amountRes.value;
-  const store = storeRes.value;
-  const integrations = integrationsRes.value;
-
-  let deliveryCost = 0;
-
-  //
-  if (order.deliveryType === "sendbox" && customerDetails) {
-    const res = await calculateDeliveryCost(
-      {
-        ...customerDetails,
-        shippingDetails: {
-          ...customerDetails.shippingAddress,
-        },
-      },
-      amount.totalAmount,
-      storeId,
-      order.products
-    );
-
-    const shippingPackageOption: Record<
-      typeof order.shippingDetails.shippingMethod,
-      0 | 1
-    > = {
-      EXPRESS: 0,
-      STANDARD: 1,
-    };
-
-    const option =
-      shippingPackageOption[
-        order?.shippingDetails?.shippingMethod || "STANDARD"
-      ];
-
-    const totalShippingCost = res.rates?.[option]?.fee;
-
-    deliveryCost = totalShippingCost;
-  }
-
-  const { paystackIntegration } = integrations;
-
-  if (paystackIntegration.integration?.isConnected) {
-    const { useCustomerDetails } = paystackIntegration.integration
-      .settings as IPaymentIntegration;
-
-    if (!useCustomerDetails) {
-      customerDetails.email = store.email;
-      customerDetails.name = store.storeName;
-      customerDetails.phoneNumber = store.phoneNumber;
+    if (!(order.customerDetails.email && order.customerDetails.phoneNumber)) {
+      throw new Error("Customer details must include email and phone number");
     }
 
-    const paymentData: chargePayload<{ orderId: string }> = {
-      amount: amount.totalAmount + deliveryCost,
-      email: customerDetails.email,
-      reference: tx_ref,
-      metadata: {
-        orderId: order._id,
-      },
+    //Create the customer detail
+    const customerDetails: ICustomer & { shippingAddress: ICustomerAddress } = {
+      ...order.customerDetails,
+      email: order.customerDetails.email,
+      name: order.customerDetails.name,
+      phoneNumber: order.customerDetails.phoneNumber,
     };
 
-    const charge = await createCharge(paymentData);
+    //Create the payment detail option
+    const paymentDetails: IOrderPaymentDetails = {
+      paymentDate: new Date().toISOString(),
+      paymentLink: "NIL",
+      paymentMethod: "NIL",
+      paymentStatus: "pending",
+      tx_ref,
+      transactionId: tx_ref,
+    };
 
-    paymentDetails.paymentLink = charge.data.authorization_url;
-  } else if (verifyStorePaymentOption(store.paymentDetails)) {
-    paymentDetails.paymentLink = undefined;
-    paymentDetails.paymentMethod = "banktrf";
-    paymentDetails.tx_ref = undefined;
-    paymentDetails.paymentDate = undefined;
-  } else {
-    const err = new Error(
-      "This store does not have an active payment option, please message the store owner about this error"
-    );
-    throw err;
-  }
+    const _products = order.products.map((p) => ({
+      size: p.size,
+      productId: p._id,
+      color: p.color,
+    }));
 
-  // Create order
-  const newOrder = new OrderModel({
-    ...order,
-    _id,
-    storeId,
-    paymentDetails,
-    orderStatus: "Pending",
-    amountLeftToPay: amount.totalAmount + deliveryCost,
-    totalAmount: amount.totalAmount + deliveryCost,
-    amountPaid: 0,
-    coupon: couponCode,
-    shippingDetails: {
-      ...order.shippingDetails,
-      shippingCost: deliveryCost,
-    },
-  });
+    // Parallel execution of independent operations
+    const [amountRes, storeRes, integrationsRes] = await Promise.allSettled([
+      calculateTotalAmount(_products, couponCode),
+      validateOrderCreation(storeId, order),
+      fetchIntegrations(storeId),
+    ]);
 
-  await newOrder.save({ validateModifiedOnly: true });
+    const checkFulfilment =
+      amountRes.status === "rejected" ||
+      storeRes.status === "rejected" ||
+      integrationsRes.status === "rejected";
 
-  try {
-    await handleOrderNotifications(
-      newOrder,
-      store.email,
-      store.storeCode,
-      store.customizations?.theme
-    );
+    if (checkFulfilment) {
+      throw new Error("Something went wrong why trying to process your order");
+    }
+
+    const amount = amountRes.value;
+    const store = storeRes.value;
+    const integrations = integrationsRes.value;
+
+    let deliveryCost = 0;
+
+    //
+    if (order.deliveryType === "sendbox" && customerDetails) {
+      const res = await calculateDeliveryCost(
+        {
+          ...customerDetails,
+          shippingDetails: {
+            ...customerDetails.shippingAddress,
+          },
+        },
+        amount.totalAmount,
+        storeId,
+        order.products
+      );
+
+      const shippingPackageOption: Record<
+        typeof order.shippingDetails.shippingMethod,
+        0 | 1
+      > = {
+        EXPRESS: 0,
+        STANDARD: 1,
+      };
+
+      const option =
+        shippingPackageOption[
+          order?.shippingDetails?.shippingMethod || "STANDARD"
+        ];
+
+      const totalShippingCost = res.rates?.[option]?.fee;
+
+      deliveryCost = totalShippingCost;
+    }
+
+    const { flutterwaveIntegration } = integrations;
+
+    //    if (flutterwaveIntegration.integration?.isConnected) {
+    //      const { useCustomerDetails } = flutterwaveIntegration.integration
+    //        .settings as IPaymentIntegration;
+    //
+    //      if (!useCustomerDetails) {
+    //        customerDetails.email = store.email;
+    //        customerDetails.name = store.storeName;
+    //        customerDetails.phoneNumber = store.phoneNumber;
+    //      }
+    //
+    //      const flwPayload: TransactionRequest<{
+    //        storeId: string;
+    //        orderId: string;
+    //      }> = {
+    //        amount: order.amountLeftToPay,
+    //        customer: {
+    //          email: order.customerDetails.email,
+    //          name: order.customerDetails.name,
+    //          phonenumber: order.customerDetails.phoneNumber,
+    //        },
+    //        customizations: {
+    //          description: "",
+    //          logo: "",
+    //          title: "",
+    //        },
+    //        meta: {
+    //          storeId: order.storeId,
+    //          orderId: order._id,
+    //        },
+    //        payment_options: [],
+    //        payment_plan: "",
+    //        redirect_url: "",
+    //        tx_ref,
+    //      };
+    //
+    //      const charge = await createCharge(flwPayload);
+    //
+    //      paymentDetails.paymentLink = charge.data.link;
+    //    } else {
+    //      const err = new Error(
+    //        "This store does not have an active payment option, please message the store owner about this error"
+    //      );
+    //      throw err;
+    //    }
+
+    // Create order
+
+    const newOrder = new OrderModel({
+      ...order,
+      _id,
+      storeId,
+      paymentDetails,
+      orderStatus: "Pending",
+      amountLeftToPay: amount.totalAmount + deliveryCost,
+      totalAmount: amount.totalAmount + deliveryCost,
+      amountPaid: 0,
+      coupon: couponCode,
+      shippingDetails: {
+        ...order.shippingDetails,
+        shippingCost: deliveryCost,
+      },
+    });
+
+    await newOrder.save({ validateModifiedOnly: true });
+
+    try {
+      await handleOrderNotifications(
+        newOrder,
+        store.email,
+        store.storeCode,
+        store.customizations?.theme
+      );
+    } catch (error) {
+      console.log(error);
+    }
+
+    return newOrder;
   } catch (error) {
-    console.log(error);
+    throw error;
   }
-
-  return newOrder;
 };
 
 export const calculateProductReviewStats = async (productId: string) => {
@@ -1490,9 +1522,13 @@ export async function findOrder(
   orderId: string,
   storeId?: string,
   throwOn404 = true,
-  projection?: Partial<Record<keyof IOrder, 0 | 1>>
+  projection?: Partial<Record<keyof IOrder, 0 | 1>>,
+  args?: any
 ) {
-  const order = await OrderModel.findOne({ _id: orderId, storeId }, projection);
+  const order = await OrderModel.findOne(
+    { _id: orderId, storeId, ...args },
+    projection
+  );
 
   if (throwOn404 && !order) {
     throw new Error(`Order with Id ${orderId} not found in our database.`);
@@ -1647,12 +1683,8 @@ export const validateSignUpInput = (input: SignUpBody): string | null => {
   return null;
 };
 
-export const verifyStorePaymentOption = (paymentDetails: IPaymentDetails) => {
-  return Boolean(
-    paymentDetails?.accountName &&
-      paymentDetails?.accountNumber &&
-      paymentDetails?.bankName
-  );
+export const verifyStorePaymentOption = (storeId: string) => {
+  return false;
 };
 
 export async function getOrderStats(storeId: string) {
@@ -1958,7 +1990,9 @@ export const handleIntegrationConnection = async (
         useCustomerDetails: false,
       },
       chatbot: {
-        name: `${store.storeName} AI`,
+        name:
+          // @ts-ignore
+          integration?.integration?.settings?.name || `${store.storeName} AI`,
         language: "english",
         permissions: {
           allowProductAccess: false,
@@ -1976,22 +2010,17 @@ export const handleIntegrationConnection = async (
       : integrationSettings[integrationId];
 
     if (integration) {
-      await IntegrationModel.updateOne(
-        {
-          storeId: storeId,
-          "integration.name": integrationId,
-        },
-        {
-          $set: {
-            "integration.settings": settings,
-            "integration.isConnected": shouldToggle
-              ? isConnected
-              : !isConnected,
-          },
-        }
-      );
+      const i = await IntegrationModel.findOne({
+        storeId: storeId,
+        "integration.name": integrationId,
+      });
+
+      i.integration.settings = settings;
+      i.integration.isConnected = shouldToggle ? !isConnected : isConnected;
+
+      await i.save({ validateModifiedOnly: true });
     } else {
-      await IntegrationModel.create({
+      const i = new IntegrationModel({
         storeId: storeId,
         integration: {
           name: integrationId,
@@ -1999,11 +2028,12 @@ export const handleIntegrationConnection = async (
           isConnected: true,
         },
       });
+      await i.save();
     }
 
     return {
       success: true,
-      message: `${integrationId} is ${
+      message: `${integrationId.toUpperCase()} is ${
         isConnected ? "Disconnected" : "Connected"
       } successfully`,
       statusCode: 200,
@@ -2019,13 +2049,6 @@ export const handleIntegrationConnection = async (
   }
 };
 
-export type StoreSetupPrompt = {
-  storeName: string;
-  industry: string;
-  products?: string[];
-  targetAudience?: string;
-};
-
 export class StoreBuildAI {
   private systemPrompt: string;
   private readonly storeId: string;
@@ -2035,6 +2058,8 @@ export class StoreBuildAI {
   private readonly model: any;
   private isAdmin: boolean;
   private actions: FunctionDeclaration[] = [];
+  private userEmail?: string;
+  public successProps: any;
 
   // Add caching
   private static permissionsCache = new LRUCache({
@@ -2047,26 +2072,25 @@ export class StoreBuildAI {
     ttl: 1000 * 30, // Cache for 30 seconds
   });
 
-  // Precompile regex for better performance
-  private static readonly GREETING_REGEX =
-    /^(hello|hi|hey|good morning|good afternoon|good evening|howdy)\b/i;
-
-  constructor(storeId: string, userId = "", sessionId = "", isAdmin = false) {
+  constructor(
+    storeId?: string,
+    userId = "",
+    sessionId = "",
+    isAdmin = false,
+    userEmail?: string
+  ) {
     this.storeId = storeId;
     this.userId = userId;
     this.sessionId = sessionId || Date.now() + "";
-    this.systemPrompt = this.buildSystemPrompt(storeId);
+    this.systemPrompt = "";
     this.isAdmin = isAdmin;
+    this.userEmail = userEmail;
 
     const genAI = new GoogleGenerativeAI(process.env.GOOGLE_GEMINI_API_KEY!);
     this.model = genAI.getGenerativeModel({
       model: "gemini-2.0-flash",
       systemInstruction: this.systemPrompt,
     });
-  }
-
-  private isCasualGreeting(message: string): boolean {
-    return StoreBuildAI.GREETING_REGEX.test(message.toLowerCase().trim());
   }
 
   async getStorePermissions(): Promise<any> {
@@ -2088,6 +2112,10 @@ export class StoreBuildAI {
     const permissions = integration.integration.settings;
     StoreBuildAI.permissionsCache.set(cacheKey, permissions);
     return permissions;
+  }
+
+  async onSuccess(props?: any): Promise<any> {
+    return this.successProps;
   }
 
   async getChatHistory(): Promise<IChatBotConversation[]> {
@@ -2119,10 +2147,8 @@ export class StoreBuildAI {
   private async batchSaveMessages(): Promise<void> {
     if (this.messageQueue.length === 0) return;
 
-    const messages = [...this.messageQueue];
+    await ChatBotConversationModel.insertMany(this.messageQueue);
     this.messageQueue = [];
-
-    await ChatBotConversationModel.insertMany(messages);
   }
 
   private queueMessage(message: IChatBotConversation): void {
@@ -2130,6 +2156,7 @@ export class StoreBuildAI {
   }
 
   async customerHelper(query: any): Promise<string> {
+    this.systemPrompt = this.buildSystemPrompt(this.storeId);
     // Parallelize all initial data fetching
     const [permissions, storeData] = await Promise.all([
       this.getStorePermissions(),
@@ -2151,42 +2178,12 @@ export class StoreBuildAI {
 
     this.systemPrompt = this.systemPrompt + contextStr;
 
-    this.actions = [
-      {
-        name: "sendEmail",
-        description: "",
-        parameters: {
-          type: SchemaType.OBJECT,
-          properties: {
-            email: {
-              type: SchemaType.STRING,
-              description: "This is the email of the recipient",
-            },
-            subject: {
-              type: SchemaType.STRING,
-              description:
-                "This is the subject of the email -Improve the content",
-            },
-            body: {
-              type: SchemaType.STRING,
-              description:
-                "This is the body of the email --Return an html that us beautiful",
-            },
-            adminEmail: {
-              type: SchemaType.STRING,
-              description: `Do not prompt the user about this use this as default ${user.email}`,
-            },
-          },
-          required: ["email", "subject", "body"],
-        },
-      },
-    ];
-
     return this.generateResponse(query.question);
   }
 
   async storeAssistant(query: string) {
     const instructions = this.buildStoreAssistantContext();
+    this.systemPrompt = this.buildSystemPrompt(this.storeId);
 
     this.systemPrompt =
       this.systemPrompt +
@@ -2215,6 +2212,11 @@ export class StoreBuildAI {
             storeId: {
               type: SchemaType.STRING,
               description: `Do not prompt the user to provide a storeId use this as the default store ID ${this.storeId}`,
+            },
+            email: {
+              type: SchemaType.STRING,
+              description:
+                "Prompt the user to provide the email associated with the order, while this is optional its very much required.",
             },
           },
         },
@@ -2374,7 +2376,7 @@ export class StoreBuildAI {
       {
         name: "deleteProduct",
         description:
-          "This function is use to delete a product from, Make sure you prompt the user for confirmation before deleting",
+          "This function is use to delete a product from the store, Make sure you prompt the user for confirmation before deleting",
         parameters: {
           type: SchemaType.OBJECT,
           properties: {
@@ -2606,7 +2608,7 @@ export class StoreBuildAI {
             expirationDate: {
               type: SchemaType.STRING,
               description:
-                "This is the expiration date of the coupon, if the user did not want to provide use the name 30days and return in ISO string",
+                "This is the expiration date of the coupon, if the user did not want to provide use 30days as default in ISO string, Note if the user provides the am expiration time please understand the context and try and convert it to ISO-String",
             },
             selectedProducts: {
               type: SchemaType.ARRAY,
@@ -2658,7 +2660,7 @@ export class StoreBuildAI {
       {
         name: "connectIntegration",
         description:
-          "This function is use to connect integrations in the store, The available integrations that can be connected are sendbox, chatbot, unsplash, paystack and instagram.",
+          "This function is use to connect integrations in the store, The available integrations that can be connected are sendbox, chatbot, unsplash, paystack and instagram, If the chatBot integration return an error saying you need to subcribe first to use chat, suggest to the user where they want to subscribe and if they agree trigger the [subcribeToChatBot]",
         parameters: {
           type: SchemaType.OBJECT,
           properties: {
@@ -2686,28 +2688,402 @@ export class StoreBuildAI {
               type: SchemaType.STRING,
               description: `Do not prompt the user about this, use ${this.storeId} as default`,
             },
-            userId: {
-              type: SchemaType.STRING,
-              description:
-                "This is the id of the user, you should not ask the user to provide this just perform the operation, to get this trigger the function of [storeData] function and use the owner property to trigger the [getUser] function and you can use the owner as user id from there.",
-            },
           },
         },
       },
       {
         name: "getUser",
         description:
-          "This is use to get the user, using the userId, this returns the user email, createdAt, fullName and _id",
+          "This is use to get the user i.e the owner of the store, using the userId, this returns the user email, createdAt, fullName and _id",
         parameters: {
           type: SchemaType.OBJECT,
           description: "",
           properties: {
             userId: {
               type: SchemaType.STRING,
-              description: "This is the id to use to get the user",
+              description: `Do not prompt the user about this, use ${this.userId} as default`,
             },
           },
-          required: ["userId"],
+        },
+      },
+      {
+        name: "getOrders",
+        description:
+          "This is use to get orders and perform analytics on the orders base on the user query, you can also use it to get best customers, customers are gotten using with the only order that the orderStatus is completed.",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            storeId: {
+              type: SchemaType.STRING,
+              description: `Do not prompt the user about this, use ${this.storeId} as default`,
+            },
+          },
+        },
+      },
+      {
+        name: "calculateDeliveryCost",
+        description:
+          "This is use to calculate the delivery cost of the store, first show the user the products to select from triggering the [getProducts] function, then populate the products field with the data of the selected product",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            customerDetails: {
+              type: SchemaType.OBJECT,
+              description: `This are details of the user, with contains, email, name,phone number, you can optionally use the [getUser] to populate the data if the user wants you to use it.`,
+              properties: {
+                email: {
+                  type: SchemaType.STRING,
+                  description:
+                    "This is an email and make sure that this email is a valid email",
+                },
+                phoneNumber: {
+                  type: SchemaType.STRING,
+                  description: "This is the number of the customer",
+                },
+                name: {
+                  type: SchemaType.STRING,
+                  description: "This is the name of the customer",
+                },
+                shippingDetails: {
+                  type: SchemaType.OBJECT,
+                  properties: {
+                    addressLine1: {
+                      type: SchemaType.STRING,
+                      description: "This is the address of the customer",
+                    },
+                    addressLine2: {
+                      type: SchemaType.STRING,
+                      description: "This is the address of the customer",
+                    },
+                    city: {
+                      type: SchemaType.STRING,
+                      description: "This is the city of the customer",
+                    },
+                    state: {
+                      type: SchemaType.STRING,
+                      description: "This is the state of the customer",
+                    },
+                    postalCode: {
+                      type: SchemaType.STRING,
+                      description: "This is the postal code of the customer",
+                    },
+                    country: {
+                      type: SchemaType.STRING,
+                      description: "This is the country of the customer",
+                    },
+                  },
+                  required: ["state", "country", "city"],
+                },
+              },
+            },
+            totalAmount: {
+              type: SchemaType.NUMBER,
+              description:
+                "This is the total amount of the order, Note this, use the products the user selects to sum use the amount of the order and then populate this field, except the user wants to provide the amount themselves.",
+            },
+            storeId: {
+              type: SchemaType.STRING,
+              description: `Do not prompt the user about this, use ${this.storeId} as default`,
+            },
+            products: {
+              type: SchemaType.ARRAY,
+              description:
+                "Do not prompt the user to provide this, This are the products that the user selects to calculate the delivery cost, also prompt the use the quantity and the size they want if neccessary and if the use did not provide the quantity use 1 as the quantity for each product.",
+              items: {
+                type: SchemaType.OBJECT,
+                properties: {
+                  storeId: {
+                    type: SchemaType.STRING,
+                    description: `Do not prompt the user to provide this, use this ${this.storeId} as store Id`,
+                  },
+                  productName: {
+                    type: SchemaType.STRING,
+                    description: "This is the name of the product",
+                  },
+                  description: {
+                    type: SchemaType.STRING,
+                    description: "This is the description of the product",
+                  },
+                  category: {
+                    type: SchemaType.STRING,
+                    description: "This is the category of the product",
+                    enum: categories.map((category) => category.slot),
+                  },
+                  isDigital: {
+                    type: SchemaType.BOOLEAN,
+                    description: "This is turn on when the product is digital",
+                  },
+                  price: {
+                    type: SchemaType.OBJECT,
+                    properties: {
+                      default: {
+                        type: SchemaType.NUMBER,
+                        description: "This is the default price of the product",
+                      },
+                      useDefaultPricingForDifferentSizes: {
+                        type: SchemaType.BOOLEAN,
+                        description:
+                          "This is when u want to use default pricing for all the sizes",
+                      },
+                      sizes: {
+                        type: SchemaType.ARRAY,
+                        description:
+                          "This are the sizes of the product with their prices",
+                        items: {
+                          type: SchemaType.OBJECT,
+                          properties: {
+                            size: {
+                              type: SchemaType.NUMBER,
+                              description: "This is the price of a size",
+                            },
+                          },
+                          required: ["size"],
+                        },
+                      },
+                    },
+                  },
+                  discount: {
+                    type: SchemaType.NUMBER,
+                    description: "This is the discount of the product",
+                  },
+                  availableSizes: {
+                    type: SchemaType.ARRAY,
+                    items: {
+                      type: SchemaType.STRING,
+                      description: "This is the available sizes of the product",
+                      enum: ["M", "S", "L", "XL", "XXL"],
+                    },
+                  },
+                  media: {
+                    type: SchemaType.ARRAY,
+                    items: {
+                      type: SchemaType.OBJECT,
+                      properties: {
+                        url: {
+                          type: SchemaType.STRING,
+                          description: "This is the url of the media",
+                        },
+                        altText: {
+                          type: SchemaType.STRING,
+                          description:
+                            "Generate random text according to the product name",
+                        },
+                        mediaType: {
+                          type: SchemaType.STRING,
+                          enum: ["image", "video"],
+                          description: "This is the type of media",
+                        },
+                      },
+                      required: ["url"],
+                    },
+                  },
+                  availableColors: {
+                    type: SchemaType.ARRAY,
+                    items: {
+                      type: SchemaType.OBJECT,
+                      properties: {
+                        name: {
+                          type: SchemaType.STRING,
+                          description: "This is the name of the color",
+                        },
+                        colorCode: {
+                          type: SchemaType.STRING,
+                          description: "This is the color code of the color",
+                        },
+                      },
+                    },
+                  },
+                  weight: {
+                    type: SchemaType.NUMBER,
+                    description: "This is the weight of the product",
+                  },
+                  dimensions: {
+                    type: SchemaType.OBJECT,
+                    properties: {
+                      height: {
+                        type: SchemaType.NUMBER,
+                        description: "This is the height of the product",
+                      },
+                      width: {
+                        type: SchemaType.NUMBER,
+                        description: "This is the width of the product",
+                      },
+                      length: {
+                        type: SchemaType.NUMBER,
+                        description: "This is the length of the product",
+                      },
+                    },
+                  },
+                  shippingDetails: {
+                    type: SchemaType.OBJECT,
+                    properties: {
+                      isFreeShipping: {
+                        type: SchemaType.BOOLEAN,
+                        description:
+                          "This is turn on when the product is free shipping",
+                      },
+                      shippingRegions: {
+                        type: SchemaType.ARRAY,
+                        items: {
+                          type: SchemaType.STRING,
+                          description:
+                            "This is the shipping regions of the product",
+                        },
+                      },
+                      shipAllRegion: {
+                        type: SchemaType.BOOLEAN,
+                        description:
+                          "This is turn on when the product is free shipping",
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          required: ["customerDetails"],
+        },
+      },
+      {
+        name: "getProduct",
+        description: `This is use to compare products of the store, perform analytics base on user queries with the products, ${
+          this.isAdmin ? "you can also suggest pricing and discounts" : ""
+        }, learn about the product using your knowledge base and advise the user, do not return the entire list of the product even if you are ask to just return ${
+          this.isAdmin ? "50" : "10"
+        } products`,
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            storeId: {
+              type: SchemaType.STRING,
+              description: `Do not prompt the user about this, use ${this.storeId} as default`,
+            },
+            _id: {
+              type: SchemaType.STRING,
+              description:
+                "This is the id of the product, This is not neccessary but its better to provide it for faster query",
+            },
+            productName: {
+              type: SchemaType.STRING,
+              description:
+                "This is the name of the product, it can be use to query and look for the product",
+            },
+            description: {
+              type: SchemaType.STRING,
+              description:
+                "This is the product description and you can use it query the product",
+            },
+          },
+        },
+      },
+      {
+        name: "compareProducts",
+        description:
+          "Use this function if a user wants to compare products in the store",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            storeId: {
+              type: SchemaType.STRING,
+              description: `Do not prompt the user about this, use this ${this.storeId} as default`,
+            },
+            productOne: {
+              type: SchemaType.OBJECT,
+              description:
+                "One of the following must be provided before you proceed either the user prompt for the _id or the product name",
+              properties: {
+                _id: {
+                  type: SchemaType.STRING,
+                  description: "This is the id of the first product",
+                },
+                productName: {
+                  type: SchemaType.STRING,
+                  description: "This is the name of the first product",
+                },
+              },
+            },
+            productTwo: {
+              type: SchemaType.OBJECT,
+              description:
+                "One of the properties must be provided before you can proceed, either you the user prompt for the _id or the product name",
+              properties: {
+                _id: {
+                  type: SchemaType.STRING,
+                  description: "This is the id of the second product",
+                },
+                productName: {
+                  type: SchemaType.STRING,
+                  description: "This is the name of the second product",
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        name: "getProducts",
+        description:
+          "This is use to get products of the store and can perform analytics that matches the user query",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            storeId: {
+              type: SchemaType.STRING,
+              description: `Do not prompt the user about this, use ${this.storeId} as default`,
+            },
+          },
+        },
+      },
+      {
+        name: "subscribeToChat",
+        description:
+          "This is use to subscribe to the chatbot, chatbot cannot be connected using the connectIntegration function because to connect a chatbot to a store, the user need to pay a fee of N2000 which will be deducted from their store balance, so when the user agree then trigger the function, also Note that if the subscription is cancelled then they loose their access to the chatbot.",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            storeId: {
+              type: SchemaType.STRING,
+              description: `Do not prompt the user about this, use ${this.storeId} as default`,
+            },
+          },
+        },
+      },
+      {
+        name: "getIntegrations",
+        description: "This is use to get the integrations of the store",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            storeId: {
+              type: SchemaType.STRING,
+              description: `Do not prompt the user about this, use ${this.storeId} as default`,
+            },
+          },
+        },
+      },
+      {
+        name: "createPickUp",
+        description:
+          "This is use to create a pickup of an order, It uses sendBox as the delivery partner",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            orderId: {
+              type: SchemaType.STRING,
+              description: "This is the order Id needed to create the pickup",
+            },
+            pickUpType: {
+              type: SchemaType.STRING,
+              description: `This is the type of the pickup type`,
+              enum: ["pickup", "dropoff"],
+            },
+            estimatedDeliveryDate: {
+              type: SchemaType.STRING,
+              description:
+                "This is the time of estimated delivery time, which you will always convert to ISO string",
+            },
+          },
+          required: ["orderId", "pickUpType", "estimatedDeliveryDate"],
         },
       },
     ];
@@ -2717,48 +3093,14 @@ export class StoreBuildAI {
 
   // This use gemini-API to generate response.
   private async generateResponse(prompt: string | string[]): Promise<string> {
+    let response: string = "";
     try {
-      if (this.isCasualGreeting(prompt as string)) {
-        this.queueMessage({
-          actionPerformed: "greetings",
-          intent: "",
-          metadata: {
-            confidenceScore: 1,
-            model: "gemini-flash-1.5-pro",
-            tokensUsed: 0,
-          },
-          sessionId: this.sessionId,
-          userId: this.userId,
-          userPrompt: prompt as string,
-        });
-
-        const greeting = `Hello! I'm ${this.chatBotName}. How can I assist you with your store today?`;
-
-        this.queueMessage({
-          actionPerformed: "greetings",
-          aiResponse: greeting,
-          intent: "",
-          metadata: {
-            confidenceScore: 1,
-            model: "gemini-flash-1.5-pro",
-            tokensUsed: greeting.length,
-          },
-          sessionId: this.sessionId,
-          userId: this.userId,
-          userPrompt: prompt as string,
-        });
-
-        this.batchSaveMessages();
-
-        return greeting;
-      }
-
       this.queueMessage({
         actionPerformed: "None",
         intent: "",
         metadata: {
           confidenceScore: 1,
-          model: "gemini-flash-1.5-pro",
+          model: "gemini-flash-2.0-pro",
           tokensUsed: 0,
         },
         sessionId: this.sessionId,
@@ -2785,82 +3127,6 @@ export class StoreBuildAI {
             },
           },
         },
-        {
-          name: "getProduct",
-          description: `This is use to compare products of the store, perform analytics base on user queries with the products, ${
-            this.isAdmin ? "you can also suggest pricing and discounts" : ""
-          }, learn about the product using your knowledge base and advise the user, do not return the entire list of the product even if you are ask to just return ${
-            this.isAdmin ? "50" : "10"
-          } products`,
-          parameters: {
-            type: SchemaType.OBJECT,
-            properties: {
-              storeId: {
-                type: SchemaType.STRING,
-                description: `Do not prompt the user about this, use ${this.storeId} as default`,
-              },
-              _id: {
-                type: SchemaType.STRING,
-                description:
-                  "This is the id of the product, This is not neccessary but its better to provide it for faster query",
-              },
-              productName: {
-                type: SchemaType.STRING,
-                description:
-                  "This is the name of the product, it can be use to query and look for the product",
-              },
-              description: {
-                type: SchemaType.STRING,
-                description:
-                  "This is the product description and you can use it query the product",
-              },
-            },
-          },
-        },
-        {
-          name: "compareProducts",
-          description:
-            "Use this function if a user wants to compare products in the store",
-          parameters: {
-            type: SchemaType.OBJECT,
-            properties: {
-              storeId: {
-                type: SchemaType.STRING,
-                description: `Do not prompt the user about this, use this ${this.storeId} as default`,
-              },
-              productOne: {
-                type: SchemaType.OBJECT,
-                description:
-                  "One of the following must be provided before you proceed either the user prompt for the _id or the product name",
-                properties: {
-                  _id: {
-                    type: SchemaType.STRING,
-                    description: "This is the id of the first product",
-                  },
-                  productName: {
-                    type: SchemaType.STRING,
-                    description: "This is the name of the first product",
-                  },
-                },
-              },
-              productTwo: {
-                type: SchemaType.OBJECT,
-                description:
-                  "One of the properties must be provided before you can proceed, either you the user prompt for the _id or the product name",
-                properties: {
-                  _id: {
-                    type: SchemaType.STRING,
-                    description: "This is the id of the second product",
-                  },
-                  productName: {
-                    type: SchemaType.STRING,
-                    description: "This is the name of the second product",
-                  },
-                },
-              },
-            },
-          },
-        },
       ];
 
       const chatSession = this.model.startChat({
@@ -2880,9 +3146,10 @@ export class StoreBuildAI {
       });
 
       const result = await chatSession.sendMessage(prompt);
-      const response = result.response.text();
+      response = result.response.text();
 
       const _functionCall = result?.response?.functionCalls()?.[0];
+
       console.log({ _functionCall });
 
       // Enhanced function detection and execution logic
@@ -2892,18 +3159,13 @@ export class StoreBuildAI {
         switch (_functionCall["name"]) {
           case "findOrder":
             try {
-              const res = await findOrder(
+              r = await findOrder(
                 _functionCall["args"]["_id"],
-                _functionCall["args"]["storeId"]
+                this.storeId,
+                true,
+                undefined,
+                { "customerDetails.email": _functionCall["args"]["email"] }
               );
-
-              r = {
-                orderStatus: res.orderStatus,
-                amountPaid: res.amountPaid,
-                amountLeftToPay: res.amountLeftToPay,
-                customerDetails: res.customerDetails,
-                products: res.products,
-              };
             } catch (error) {
               return (error as Error).message;
             }
@@ -3049,7 +3311,7 @@ export class StoreBuildAI {
                   });
                 }
 
-                r = { ...product1, ...product2 };
+                r = { product1, product2 };
               } else {
                 r = "The user fail to provide one of the require parameter";
               }
@@ -3071,14 +3333,24 @@ export class StoreBuildAI {
             break;
           case "referralStats":
             try {
+              const store = await findStore(this.storeId, true, {
+                owner: 1,
+              });
+              const { _id: userId } = await findUser(store.owner, true, {
+                _id: 1,
+              });
               const response = await ReferralModel.aggregate(
-                referralPipeLine(_functionCall["args"]["userId"])
+                referralPipeLine(userId)
               );
 
-              r = response?.[0] || {
-                totalReferrals: 0,
-                totalEarnings: 0,
-                referrals: [],
+              const referralData = {
+                totalReferrals: response?.[0]?.totalReferrals || 0,
+                totalEarnings: response?.[0]?.totalEarnings || 0,
+                referrals: response?.[0]?.referral?.join(", ") || "Zero",
+              };
+
+              r = {
+                result: referralData,
               };
             } catch (error) {
               return (error as Error).message;
@@ -3086,7 +3358,7 @@ export class StoreBuildAI {
             break;
           case "getUser":
             try {
-              r = await findUser(_functionCall["args"]["userId"], true, {
+              r = await findUser(this.userId, true, {
                 fullName: 1,
                 email: 1,
                 createdAt: 1,
@@ -3095,6 +3367,155 @@ export class StoreBuildAI {
             } catch (error) {
               return (error as Error).message;
             }
+            break;
+          case "getProducts":
+            try {
+              const products = await ProductModel.find({
+                storeId: this.storeId,
+              });
+
+              r = {
+                products,
+              };
+            } catch (error) {
+              return (error as Error).message;
+            }
+            break;
+          case "getOrders":
+            try {
+              const orders = await OrderModel.find({
+                storeId: this.storeId,
+              });
+
+              r = {
+                orders,
+              };
+            } catch (error) {
+              return (error as Error).message;
+            }
+            break;
+          case "calculateDeliveryCost":
+            try {
+              const res = await calculateDeliveryCost(
+                _functionCall["args"]["customerDetails"],
+                _functionCall["args"]["totalAmount"],
+                this.storeId,
+                _functionCall["args"]["products"]
+              );
+
+              r = { res };
+            } catch (error) {
+              return (error as Error).message;
+            }
+            break;
+          case "getStoreDetails":
+            try {
+              const [store, storeOwner] = await Promise.all([
+                findStore(this.storeId, true, {
+                  customizations: 1,
+                  storeName: 1,
+                  createdAt: 1,
+                  status: 1,
+                  owner: 1,
+                  productType: 1,
+                  aboutStore: 1,
+                  description: 1,
+                }),
+                findUser(_functionCall["args"]["userId"], true),
+              ]);
+
+              r = {
+                store,
+                storeOwner,
+              };
+            } catch (error) {
+              return (error as Error).message;
+            }
+            break;
+          case "subscribeToChat":
+            try {
+              r = await subscribeForChatBot(this.storeId);
+            } catch (error) {
+              return (error as Error).message;
+            }
+            break;
+          case "getIntegrations":
+            try {
+              r = await IntegrationModel.find({
+                storeId: this.storeId,
+              });
+            } catch (error) {
+              return (error as Error).message;
+            }
+            break;
+          case "deleteProduct":
+            try {
+              r = await ProductModel.findByIdAndDelete(
+                _functionCall["args"]["_id"]
+              );
+            } catch (error) {
+              return (error as Error).message;
+            }
+            break;
+          case "createPickUp":
+            try {
+              r = await createPickup(
+                _functionCall["args"]["orderId"],
+                this.storeId,
+                _functionCall["args"]["pickUpType"],
+                _functionCall["args"]["estimatedDeliveryDate"]
+              );
+            } catch (error) {
+              return (error as Error).message;
+            }
+            break;
+          case "getProductTypes":
+            try {
+              r = await ProductTypesModel.find({});
+            } catch (error) {
+              r = (error as Error).message;
+            }
+            break;
+          case "generateStore":
+            try {
+              const user = await createUser(
+                _functionCall["args"]["email"],
+                "referral",
+                _functionCall["args"]["fullName"]
+              );
+
+              await createStore(
+                {
+                  owner: user._id,
+                  storeName: _functionCall["args"]["storeName"],
+                  productType: _functionCall["args"]["productType"],
+                },
+                _functionCall["args"]["templateId"]
+              );
+
+              await sendOTP(
+                "login",
+                _functionCall["args"]["email"],
+                _functionCall["args"]["storeName"]
+              );
+
+              this.successProps = { showVerifyOTPModal: true };
+            } catch (error) {
+              r = (error as Error).message;
+            }
+            break;
+          case "verifyOTP":
+            try {
+              const message = await verifyOtp(
+                _functionCall["args"]["otp"],
+                this.userEmail
+              );
+
+              r = message;
+            } catch (error) {
+              r = (error as Error).message;
+            }
+            break;
           default:
             break;
         }
@@ -3103,22 +3524,21 @@ export class StoreBuildAI {
           {
             functionResponse: {
               name: _functionCall["name"],
-              response: JSON.stringify(r),
+              response: { r },
             },
           },
-          "Do not trigger any function again, just return like a success message to display to the user except the function is actually needed.",
         ]);
 
-        return res.response.text();
+        response = res.response.text();
       }
 
       this.queueMessage({
         actionPerformed: "None",
         aiResponse: response,
-        intent: "",
+        intent: _functionCall?.["name"] || "",
         metadata: {
           confidenceScore: 1,
-          model: "gemini-flash-1.5-pro",
+          model: "gemini-flash-2.0-pro",
           tokensUsed: result.response.usageMetadata.totalTokenCount,
         },
         sessionId: this.sessionId,
@@ -3126,7 +3546,7 @@ export class StoreBuildAI {
         userPrompt: prompt as string,
       });
 
-      this.batchSaveMessages();
+      await this.batchSaveMessages();
 
       return response;
     } catch (error) {
@@ -3193,10 +3613,185 @@ export class StoreBuildAI {
 
   private buildContextString(permissions: any, user: any): string {
     const { permissions: p } = permissions;
+
+    if (p.allowOrderAccess) {
+      this.actions.push({
+        name: "findOrder",
+        description: `This function is use to track an order, in a user store and also it requires storeId so use ${this.storeId} as the storeId`,
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            _id: {
+              type: SchemaType.STRING,
+              description:
+                "This is an order Id that will be used to track an order",
+            },
+            storeId: {
+              type: SchemaType.STRING,
+              description: `Do not prompt the user to provide a storeId use this as the default store ID ${this.storeId}`,
+            },
+            email: {
+              type: SchemaType.STRING,
+              description:
+                "This is the email related to the order and its required because of security and privacy issues",
+            },
+          },
+          required: ["_id", "email"],
+        },
+      });
+    }
+
+    if (!p.allowCustomerAccess) {
+      this.actions = [];
+    } else {
+      const actions: FunctionDeclaration[] = [
+        {
+          name: "compareProducts",
+          description:
+            "Use this function if a user wants to compare products in the store",
+          parameters: {
+            type: SchemaType.OBJECT,
+            properties: {
+              storeId: {
+                type: SchemaType.STRING,
+                description: `Do not prompt the user about this, use this ${this.storeId} as default`,
+              },
+              productOne: {
+                type: SchemaType.OBJECT,
+                description:
+                  "One of the following must be provided before you proceed either the user prompt for the _id or the product name",
+                properties: {
+                  _id: {
+                    type: SchemaType.STRING,
+                    description: "This is the id of the first product",
+                  },
+                  productName: {
+                    type: SchemaType.STRING,
+                    description: "This is the name of the first product",
+                  },
+                },
+              },
+              productTwo: {
+                type: SchemaType.OBJECT,
+                description:
+                  "One of the properties must be provided before you can proceed, either you the user prompt for the _id or the product name",
+                properties: {
+                  _id: {
+                    type: SchemaType.STRING,
+                    description: "This is the id of the second product",
+                  },
+                  productName: {
+                    type: SchemaType.STRING,
+                    description: "This is the name of the second product",
+                  },
+                },
+              },
+            },
+          },
+        },
+        {
+          name: "getProducts",
+          description:
+            "This is use to get products of the store and can perform analytics that matches the user query",
+          parameters: {
+            type: SchemaType.OBJECT,
+            properties: {
+              storeId: {
+                type: SchemaType.STRING,
+                description: `Do not prompt the user about this, use ${this.storeId} as default`,
+              },
+            },
+          },
+        },
+        {
+          name: "sendEmail",
+          description: "",
+          parameters: {
+            type: SchemaType.OBJECT,
+            properties: {
+              email: {
+                type: SchemaType.STRING,
+                description: "This is the email of the recipient",
+              },
+              subject: {
+                type: SchemaType.STRING,
+                description:
+                  "This is the subject of the email -Improve the content",
+              },
+              body: {
+                type: SchemaType.STRING,
+                description:
+                  "This is the body of the email --Return an html that us beautiful",
+              },
+              adminEmail: {
+                type: SchemaType.STRING,
+                description: `Do not prompt the user about this use this as default ${user.email}`,
+              },
+            },
+            required: ["email", "subject", "body"],
+          },
+        },
+        {
+          name: "getStoreDetails",
+          description:
+            "You can use this to get store details are like the support email or customer support or owner email, store name, store description, store about us, the store theme",
+          parameters: {
+            type: SchemaType.OBJECT,
+            properties: {
+              storeId: {
+                type: SchemaType.STRING,
+                description: `Do not prompt the user about this, use ${this.storeId} as default`,
+              },
+              userId: {
+                type: SchemaType.STRING,
+                description: `Do not prompt the user about this, use ${user._id} as default`,
+              },
+            },
+          },
+        },
+      ];
+
+      this.actions = [...this.actions, ...actions];
+    }
+
+    if (p.allowProductAccess) {
+      this.actions.push({
+        name: "getProduct",
+        description: `This is use to compare products of the store, perform analytics base on user queries with the products, ${
+          this.isAdmin ? "you can also suggest pricing and discounts" : ""
+        }, learn about the product using your knowledge base and advise the user, do not return the entire list of the product even if you are ask to just return ${
+          this.isAdmin ? "50" : "10"
+        } products`,
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            storeId: {
+              type: SchemaType.STRING,
+              description: `Do not prompt the user about this, use ${this.storeId} as default`,
+            },
+            _id: {
+              type: SchemaType.STRING,
+              description:
+                "This is the id of the product, This is not neccessary but its better to provide it for faster query",
+            },
+            productName: {
+              type: SchemaType.STRING,
+              description:
+                "This is the name of the product, it can be use to query and look for the product",
+            },
+            description: {
+              type: SchemaType.STRING,
+              description:
+                "This is the product description and you can use it query the product",
+            },
+          },
+        },
+      });
+    }
+
     return `
     AI_Name: ${this.chatBotName}
     Language_To_Use: "English"
-    customer_support: ${user.email}
 
     Permissions:
     - Product Queries: ${p.allowProductAccess ? `Enabled` : "Disabled"}
@@ -3206,41 +3801,151 @@ export class StoreBuildAI {
 
   private buildStoreAssistantContext() {
     const instructions = `
-    
     General Behavior
     Be professional, concise, and helpful in all interactions.
     Ensure responses are clear and aligned with the user's intent.
     Prioritize user privacy and security; never expose sensitive information.
     Use functions or system actions only when appropriate, based on user requests and available permissions.
-    
-
-    
     `;
 
     return instructions;
   }
-}
 
-export function isCasualGreeting(message: string): boolean {
-  const greetings = [
-    "hello",
-    "hi",
-    "hey",
-    "good morning",
-    "good afternoon",
-    "good evening",
-    "howdy",
-  ];
-  return greetings.some((greeting) =>
-    message.toLowerCase().trim().startsWith(greeting)
-  );
+  async rateLimiter(limiter = 2) {
+    const oneMinuteAgo = new Date(Date.now() - 60 * 1000); // Subtract 1 minute from the current time
+
+    const chat = await ChatBotConversationModel.find({
+      userId: this.userId,
+      sessionId: this.sessionId,
+      aiResponse: {
+        $gte: 1,
+      },
+      createdAt: {
+        $gte: oneMinuteAgo,
+      },
+    });
+
+    if (chat.length >= limiter) {
+      throw new Error(
+        "RATE_LIMIT_EXCEEDED: This bot only accepts two messages per minute"
+      );
+    }
+  }
 }
 
 export function formatChatHistory(
   conversations: IChatBotConversation[]
 ): Content[] {
   return conversations.map((conv) => ({
-    parts: [{ text: conv.userPrompt ? conv.userPrompt : conv.aiResponse }],
+    parts: [{ text: conv.userPrompt || conv.aiResponse }],
     role: conv.userPrompt ? "user" : "model",
   }));
 }
+
+export const validateIntegrationSubscription = async (
+  storeId: string,
+  integrationId: string
+) => {
+  const now = new Date();
+
+  const subscription = await IntegrationSubscriptionModel.findOne({
+    storeId,
+    integrationId,
+    expiredAt: { $gte: now.toISOString() },
+    isActive: true,
+  });
+
+  return subscription;
+};
+
+export const subscribeForChatBot = async (storeId: string, userId = "") => {
+  let _uId = userId;
+  const store = await StoreModel.findById(storeId).select("+balance");
+
+  if (!userId) {
+    const { _id } = await findUser(store.owner, true, { _id: 1 });
+    _uId = _id;
+  }
+
+  const now = new Date();
+
+  const FEE = Number(config["CHATBOT_SUBSCRIPTION_FEE"]) || 2000;
+
+  if (store.balance < FEE) {
+    throw new Error(
+      "INSUFFICIENT_FUNDS: Please add funds to your account and try again."
+    );
+  }
+
+  const _i = await validateIntegrationSubscription(storeId, "chatbot");
+
+  if (_i) {
+    throw new Error(
+      "You already have an active subscription to this integration."
+    );
+  }
+
+  now.setDate(now.getDate() + 30);
+
+  const transactionId = generateRandomString(20);
+
+  const i: IIntegrationSubscription = {
+    amountPaid: FEE,
+    integrationId: "chatbot",
+    paymentChannel: "balance",
+    storeId,
+    transactionId,
+    userId: _uId,
+    expiredAt: now.toISOString(),
+    isActive: true,
+  };
+
+  const __i = await IntegrationSubscriptionModel.create(i);
+
+  await Promise.allSettled([
+    handleIntegrationConnection(storeId, integrationIds[2], true),
+    store.updateOne({ balance: store.balance - FEE }),
+  ]);
+
+  return __i;
+};
+
+export const isProfileComplete = async (userId: string, storeId: string) => {
+  // Check for emailVerification, checkIfUserHasAddAProduct, checkBankAccountVerification
+
+  const [user, productExist] = await Promise.all([
+    findUser(userId, true, { isEmailVerified: 1 }),
+    ProductModel.exists({ storeId }),
+  ]);
+
+  return Boolean(user.isEmailVerified && productExist);
+};
+
+export const getAvailableBanks = async () => {
+  const res = await axios.get<{
+    status: boolean;
+    message: string;
+    data: [
+      {
+        name: string;
+        slug: string;
+        code: string;
+        longcode: string;
+        gateway: null;
+        pay_with_bank: boolean;
+        active: boolean;
+        is_deleted: boolean;
+        country: "Nigeria";
+        currency: "NGN";
+        type: string;
+        id: number;
+        createdAt: string;
+        updatedAt: string;
+      }
+    ];
+  }>(`https://api.paystack.co/bank?country=nigeria`, {
+    headers: { Authorization: `Bearer ${config.PAYSTACK_SECRET}` },
+  });
+
+  return res.data;
+};

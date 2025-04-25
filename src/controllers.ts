@@ -1,4 +1,4 @@
-import { Request, Response } from "express";
+import { Request, response, Response } from "express";
 import {
   _createProduct,
   _editOrder,
@@ -24,16 +24,19 @@ import {
   formatAmountToNaira,
   generateRandomString,
   generateToken,
+  getAvailableBanks,
   getOrderStats,
   getSalesData,
   handleIntegrationConnection,
   handleReferralLogic,
   httpStatusResponse,
+  isStoreActive,
   processOrder,
   sendEmail,
   sendOTP,
   sendQuickEmail,
   StoreBuildAI,
+  subscribeForChatBot,
   validateIconExistance,
   validateProduct,
   validateSignUpInput,
@@ -41,6 +44,7 @@ import {
   verifyIntegration,
   verifyOtp,
   verifyStore,
+  verifyStorePaymentOption,
 } from "./helper";
 import {
   AddressModel,
@@ -52,6 +56,7 @@ import {
   ProductTypesModel,
   RatingModel,
   ReferralModel,
+  StoreBankAccountModel,
   StoreModel,
   StoreSttings,
   SubscriptionModel,
@@ -80,13 +85,19 @@ import {
   ITutorial,
   IUser,
   SignUpBody,
+  TransactionRequest,
 } from "./types";
 import { AuthenticatedRequest } from "./middle-ware";
 import { addDays, format, isAfter } from "date-fns";
 import mongoose, { PipelineStage } from "mongoose";
-import { EmailType, generateEmail, paymentDetailsAddedEmail } from "./emails";
+import { EmailType, generateEmail } from "./emails";
 import { config, quickEmails, referralPipeLine, themes } from "./constant";
 import ExcelJS from "exceljs";
+import {
+  PaymentService,
+  restrictPropertyModification,
+  SendBox,
+} from "./server-utils";
 
 export const joinNewsLetter = async (req: Request, res: Response) => {
   try {
@@ -366,15 +377,8 @@ export const initiateChargeForSubscription = async (
 
     const tx_ref = `TX-${generateRandomString(11)}`;
 
-    const payload: chargePayload<{ userId: string; autoRenew: boolean }> = {
-      amount: (Number(config.SUBCRIPTION_FEE) || 600) * months,
-      email,
-      metadata: {
-        userId: user,
-        autoRenew,
-      },
-      reference: tx_ref,
-    };
+    //@ts-ignore
+    const payload: TransactionRequest = {};
 
     const charge = await createCharge(payload);
 
@@ -462,39 +466,6 @@ export const getUser = async (req: AuthenticatedRequest, res: Response) => {
   }
 };
 
-export const savePaymentDetails = async (
-  req: AuthenticatedRequest,
-  res: Response
-) => {
-  try {
-    const { userId, body } = req;
-    const { accountNumber, bankCode, bankName } = body;
-
-    const accountName = await verifyBank(accountNumber, bankCode);
-
-    const user = await UserModel.findById(userId);
-    const store = await StoreModel.findOne({ owner: user.id });
-
-    const paymentDetails: IPaymentDetails = {
-      accountName,
-      accountNumber,
-      bankName: bankCode,
-    };
-
-    store.paymentDetails = paymentDetails;
-
-    await store.save();
-
-    await sendEmail(
-      user.email,
-      paymentDetailsAddedEmail(accountName, accountNumber, bankName)
-    );
-  } catch (error) {
-    const err = error as Error;
-    return res.status(500).json(httpStatusResponse(500, err.message));
-  }
-};
-
 export const getDashboardContent = async (
   req: AuthenticatedRequest,
   res: Response
@@ -519,8 +490,8 @@ export const getOrders = async (req: AuthenticatedRequest, res: Response) => {
     const { storeId } = req;
     const {
       q,
-      start = 0,
-      end = 5,
+      page = "1",
+      limit = "10",
       asc,
       filter: _filter = "All",
       startDate,
@@ -528,8 +499,8 @@ export const getOrders = async (req: AuthenticatedRequest, res: Response) => {
       sort = "",
     } = req.query as {
       q?: string;
-      start?: string;
-      end?: string;
+      page?: string;
+      limit?: string;
       asc?: string;
       filter?: "All" | "Pending" | "Completed" | "Cancelled" | "Refunded";
       startDate?: string;
@@ -537,6 +508,12 @@ export const getOrders = async (req: AuthenticatedRequest, res: Response) => {
       sort?: string;
     };
 
+    // Convert pagination params to numbers
+    const pageNum = Math.max(1, Number(page));
+    const limitNum = Math.max(1, Math.min(100, Number(limit))); // Limit maximum items per page
+    const skip = (pageNum - 1) * limitNum;
+
+    // Build filter
     const filter: any = { storeId };
 
     if (_filter && _filter !== "All") {
@@ -547,6 +524,7 @@ export const getOrders = async (req: AuthenticatedRequest, res: Response) => {
       filter.$or = createOrderQuery(q);
     }
 
+    // Handle date filtering
     const parsedStartDate = startDate ? new Date(startDate) : null;
     const parsedEndDate = endDate ? new Date(endDate) : new Date();
 
@@ -554,8 +532,12 @@ export const getOrders = async (req: AuthenticatedRequest, res: Response) => {
       filter.createdAt = { $gte: parsedStartDate, $lte: parsedEndDate };
     }
 
+    // Build sort options
     const sortOptions: any = {};
-    const sortParams = sort.split(",").map((s) => s.trim());
+    const sortParams = sort
+      .split(",")
+      .filter(Boolean)
+      .map((s) => s.trim());
 
     sortParams.forEach((param) => {
       switch (param) {
@@ -579,11 +561,15 @@ export const getOrders = async (req: AuthenticatedRequest, res: Response) => {
       sortOptions.createdAt = asc === "true" ? 1 : -1;
     }
 
-    const [orders, statusCounts] = await Promise.all([
+    // Execute queries in parallel for better performance
+    const [orders, statusCounts, totalCount] = await Promise.all([
       OrderModel.find(filter)
         .sort(sortOptions)
-        .skip(Number(start))
-        .limit(Number(end) - Number(start)),
+        .skip(skip)
+        .limit(limitNum)
+        .lean(), // Use lean() for better performance when you don't need Mongoose document methods
+
+      // Get counts by status (optimized to only return necessary fields)
       OrderModel.aggregate([
         { $match: { storeId } },
         {
@@ -593,28 +579,44 @@ export const getOrders = async (req: AuthenticatedRequest, res: Response) => {
           },
         },
       ]),
+
+      // Get total count for pagination
+      OrderModel.countDocuments(filter),
     ]);
 
+    // Process status counts
     const orderStatusCount = statusCounts.reduce((acc, { _id, count }) => {
       acc[_id] = count;
       return acc;
     }, {} as Record<string, number>);
 
+    // Calculate total for "All" status
     orderStatusCount["All"] = Object.values(orderStatusCount).reduce(
-      // @ts-ignore
-      (sum, count) => sum + count,
+      (sum: number, count: number) => sum + count,
       0
     );
+
+    // Build pagination metadata
+    const totalPages = Math.ceil(totalCount / limitNum);
+    const pagination = {
+      page: pageNum,
+      limit: limitNum,
+      totalItems: totalCount,
+      totalPages,
+      hasNextPage: pageNum < totalPages,
+      hasPrevPage: pageNum > 1,
+    };
 
     return res.status(200).json(
       httpStatusResponse(200, "Orders retrieved successfully", {
         orders,
         orderStatusCount,
+        pagination,
       })
     );
   } catch (error) {
     const err = error as Error;
-    console.error(error);
+    console.error("Error retrieving orders:", err);
     return res
       .status(500)
       .json(
@@ -969,6 +971,14 @@ export const createOrEditProduct = async (
     // Check for existing product in a single query
     const existingProduct = await ProductModel.findById(product._id);
 
+    const isDigitalProduct = existingProduct.isDigital || body.isDigital;
+
+    if (isDigitalProduct) {
+      return res
+        .status(400)
+        .json(httpStatusResponse(400, "Digital product are not available"));
+    }
+
     // Check if user can create new Product
     if (!existingProduct) {
       await checkMembershipAccess(userId, "ADD_PRODUCT", storeId);
@@ -1254,7 +1264,11 @@ export const connectAndDisconnectIntegration = async (
   res: Response
 ) => {
   const { integrationId } = req.body;
-  const result = await handleIntegrationConnection(req.storeId, integrationId);
+  const result = await handleIntegrationConnection(
+    req.storeId,
+    integrationId,
+    true
+  );
 
   return res
     .status(result.statusCode)
@@ -1290,9 +1304,23 @@ export const getIntegration = async (
     const integration = await IntegrationModel.findOne({
       storeId,
       "integration.name": params.integration,
-    });
+    }).select("+integration.apiKeys");
 
-    return res.status(200).json(httpStatusResponse(200, "", integration));
+    const hasApiKeys = Boolean(
+      integration.integration.apiKeys["accessKey"] ||
+        integration.integration.apiKeys["token"]
+    );
+
+    const {
+      integration: { apiKeys, ...i },
+    } = integration.toObject();
+
+    const INTEGRATION = {
+      integration: { ...i },
+      hasApiKeys,
+    };
+
+    return res.status(200).json(httpStatusResponse(200, "", INTEGRATION));
   } catch (error) {
     const err = error as Error;
     return res.status(500).json(httpStatusResponse(500, err.message));
@@ -1365,33 +1393,124 @@ export const getProductWithIds = async (req: Request, res: Response) => {
   }
 };
 
-export const getOrder = async (req: AuthenticatedRequest, res: Response) => {
+export const getOrder = async (req: Request, res: Response) => {
   try {
-    const { storeId } = req.query as undefined as { storeId?: string };
     const { orderId } = req.params;
+    const { phoneNumber } = req.query;
 
-    const order = await findOrder(orderId, storeId);
+    if (!phoneNumber) {
+      return res
+        .status(400)
+        .json(
+          httpStatusResponse(
+            400,
+            "Phone Number is required to view order.",
+            undefined,
+            "numberIsRequired"
+          )
+        );
+    }
 
-    let deliveryDetails = null;
-    let transactionDetails = null;
+    const order = await OrderModel.findOne({
+      _id: orderId,
+      "customerDetails.phoneNumber": phoneNumber,
+    });
+
+    if (!order) {
+      return res
+        .status(404)
+        .json(
+          httpStatusResponse(404, "Order not found", undefined, "orderNotFound")
+        );
+    }
+
+    const store = await findStore(order.storeId);
+
+    const { phoneNumber: _phoneNumber, email } = await findUser(
+      store.owner,
+      true,
+      { phoneNumber: 1, email: 1 }
+    );
 
     if (order?.shippingDetails?.trackingNumber) {
       // Get the tracking history of the order
     }
 
-    if (order.paymentDetails.transactionId) {
-      const resp = await _verifyTransaction(order.paymentDetails.tx_ref);
-
-      transactionDetails = resp.data.data;
-    }
-
     return res.status(200).json(
       httpStatusResponse(200, "order fetched successfully", {
         order: order.toObject(),
-        deliveryDetails,
-        transactionDetails,
+        store: { ...store.toObject(), phoneNumber: _phoneNumber, email },
       })
     );
+  } catch (error) {
+    console.log(error);
+    const err = error as Error;
+    return res.status(500).json(httpStatusResponse(500, err.message));
+  }
+};
+
+export const getInvoice = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { invoiceId } = req.params;
+
+    const order = await OrderModel.findById(invoiceId, {
+      customerDetails: 1,
+      paymentDetails: 1,
+      totalAmount: 1,
+      products: 1,
+      createdAt: 1,
+      orderStatus: 1,
+      storeId: 1,
+      shippingDetails: 1,
+    });
+
+    if (!order) {
+      return res
+        .status(404)
+        .json(
+          httpStatusResponse(404, "Order not found", undefined, "notFound")
+        );
+    }
+
+    const store = await findStore(order.storeId, true, {
+      storeName: 1,
+      _id: 1,
+    });
+    const storeOwner = await findUser(store.owner, true, { phoneNumber: 1 });
+
+    const storeSettings = await StoreSttings.findOne(
+      { storeId: store._id },
+      { storeAddress: 1 }
+    );
+
+    const storeBank = await StoreBankAccountModel.findOne(
+      { storeId: store._id },
+      { bankName: 1, accountName: 1, accountNumber: 1 }
+    );
+
+    const _address = storeSettings.storeAddress.find(
+      (address) => address.isDefault
+    );
+
+    const resp = {
+      companyName: store.storeName,
+      companyAddress: `${_address.country}, ${_address.state}, ${_address.city}, ${_address.postalCode}, ${_address.addressLine1}`,
+      companyPhone: storeOwner.phoneNumber,
+      orderNumber: order._id,
+      invoiceId: order._id,
+      dateIssued: order.createdAt,
+      dateDue: addDays(new Date(order.createdAt), 10).toISOString(),
+      customerName: order.customerDetails.name,
+      customerPhone: order.customerDetails.phoneNumber,
+      bankName: storeBank?.bankName.toUpperCase(),
+      accountNumber: storeBank?.accountNumber,
+      accountName: storeBank?.accountName.toUpperCase(),
+      status: order.orderStatus,
+      items: order.products,
+      shippingDetails: order.shippingDetails,
+    };
+
+    return res.status(200).json(httpStatusResponse(200, undefined, resp));
   } catch (error) {
     console.log(error);
     const err = error as Error;
@@ -1410,6 +1529,54 @@ export const getQuickEmails = async (
   } catch (error) {
     const err = error as Error;
     return res.status(500).json(httpStatusResponse(500, err.message));
+  }
+};
+
+export const editOrderForCustomer = async (req: Request, res: Response) => {
+  try {
+    const { phoneNumber, updates } = req.body;
+    const { orderId } = req.params;
+
+    //These are the list of properties that are not allow to be changed.
+    const restrictedUpdates = [
+      "orderStatus",
+      "paymentDetails",
+      "paymentStatus",
+      "createdAt",
+      "updatedAt",
+      "shippingDetails",
+      "totalAmount",
+      "storeId",
+      "amountLeftToPay",
+      "amountPaid",
+      "coupon",
+    ];
+
+    const order = await OrderModel.findOne({
+      _id: orderId,
+      "customerDetails.phoneNumber": phoneNumber,
+    });
+
+    if (!order) {
+      return res.status(404).json(httpStatusResponse(404, "Order not found"));
+    }
+
+    restrictPropertyModification(updates, restrictedUpdates);
+
+    const newOrder = await order.updateOne(
+      {
+        $set: updates,
+      },
+      {
+        new: true,
+      }
+    );
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "Order updated", newOrder));
+  } catch (error) {
+    return res.status(500).json(httpStatusResponse(500, error.message));
   }
 };
 
@@ -1435,6 +1602,14 @@ export const _sendQuickEmail = async (
         );
     }
 
+    if (order.orderStatus === "Completed") {
+      return res
+        .status(400)
+        .json(
+          httpStatusResponse(400, "This order has already been completed.")
+        );
+    }
+
     await sendQuickEmail(order, emailId, order.customerDetails.email);
 
     return res
@@ -1451,6 +1626,16 @@ export const editOrder = async (req: AuthenticatedRequest, res: Response) => {
     const { updates, partial = false } = req.body;
 
     const { orderId } = req.params;
+
+    const order = await OrderModel.findById(orderId);
+
+    if (order.orderStatus === "Completed") {
+      return res
+        .status(400)
+        .json(
+          httpStatusResponse(400, "This order has already been completed.")
+        );
+    }
 
     const newOrder = await _editOrder(orderId, updates, partial);
 
@@ -1943,7 +2128,7 @@ export const getStore = async (req: AuthenticatedRequest, res: Response) => {
       const now = new Date();
       const previewTime = new Date(store.previewFor);
 
-      const isActive = Boolean(!store.isActive && userId);
+      const isActive = Boolean(store.isActive && userId);
 
       if (now > previewTime && isActive) {
         return res
@@ -2253,21 +2438,44 @@ export const completeOrderPayment = async (req: Request, res: Response) => {
         .status(200)
         .json(httpStatusResponse(200, undefined, order.toObject()));
 
-    const tx_ref = `TX-${generateRandomString(11)}`;
+    const transaction = await TransactionModel.findById(
+      order.paymentDetails.tx_ref
+    );
 
-    const payload: chargePayload<{ orderId: string }> = {
-      amount: order.amountLeftToPay || order.totalAmount,
-      email: order.customerDetails.email,
-      reference: tx_ref,
-      metadata: {
-        orderId: order._id,
+    if (!transaction) {
+      return res
+        .status(404)
+        .json(httpStatusResponse(404, "Transaction not found"));
+    }
+
+    const tx_ref = order.paymentDetails.tx_ref;
+
+    const payload: TransactionRequest<{ storeId: string; orderId: string }> = {
+      amount: order.amountLeftToPay,
+      currency: "NGN",
+      customer: {
+        email: order.customerDetails.email,
+        name: order.customerDetails.name,
+        phonenumber: order.customerDetails.phoneNumber,
       },
+      customizations: {
+        logo: "",
+        description: "",
+        title: order.customerDetails.name + "-" + "order payments",
+      },
+      meta: {
+        storeId,
+        orderId: order.id,
+      },
+      payment_options: [],
+      redirect_url: "",
+      tx_ref,
     };
 
     const charge = await createCharge(payload);
 
-    order.paymentDetails.paymentLink = charge.data.authorization_url;
-    order.paymentDetails.tx_ref = charge.data.reference;
+    order.paymentDetails.paymentLink = charge.data.link;
+    order.paymentDetails.tx_ref = tx_ref;
     order.paymentDetails.transactionId = tx_ref;
     order.paymentDetails.paymentDate = new Date().toISOString();
 
@@ -2513,6 +2721,25 @@ export const verifyTransaction = async (req: Request, res: Response) => {
   }
 };
 
+export const verifyBillStackPayment = async (req: Request, res: Response) => {
+  const payment = new PaymentService();
+
+  try {
+    const signature = req.headers["x-wiaxy-signature"] as string;
+    const payload: any = {};
+
+    await payment.startSession();
+    await payment.verifyBillStackPayment(signature, payload);
+    await payment.commitSession();
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "Payment verified successfully"));
+  } catch (error) {
+    await payment.cancelSession();
+  }
+};
+
 export const getSalesChartData = async (
   req: AuthenticatedRequest,
   res: Response
@@ -2573,14 +2800,16 @@ export const updateUser = async (req: AuthenticatedRequest, res: Response) => {
     const { userId, body } = req;
     const { fullName, email, phoneNumber, tutorialVideoWatch } = body;
 
-    const user = await findUser({ _id: userId });
+    const user = await findUser(userId);
+
+    console.log(user);
 
     user.fullName = fullName || user.fullName;
     user.email = email || user.email;
     user.phoneNumber = phoneNumber || user.phoneNumber;
     user.tutorialVideoWatch = tutorialVideoWatch || user.tutorialVideoWatch;
 
-    const newUser = await user.save({ validateBeforeSave: true });
+    const newUser = await user.save({ validateModifiedOnly: true });
 
     return res
       .status(200)
@@ -2903,6 +3132,8 @@ export const customerAiChat = async (req: Request, res: Response) => {
 
     const ai = new StoreBuildAI(storeId, sessionId, sessionId);
 
+    await ai.rateLimiter();
+
     const r = await ai.customerHelper({ question: prompt });
 
     return res
@@ -2922,7 +3153,13 @@ export const aiStoreAssistant = async (
     const { storeId, userId } = req;
     const { query, sessionId } = req.body;
 
+    const user = await findUser(userId);
+
     const ai = new StoreBuildAI(storeId, userId, sessionId, true);
+
+    const limiter = user.plan.type === "premium" ? 9 : 3;
+
+    await ai.rateLimiter(limiter);
 
     const r = await ai.storeAssistant(query);
 
@@ -2930,5 +3167,255 @@ export const aiStoreAssistant = async (
   } catch (error) {
     const err = error as Error;
     return res.status(500).json(httpStatusResponse(500, err.message));
+  }
+};
+
+export const _subscribeToChatBot = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { storeId, userId } = req;
+
+    const i = await subscribeForChatBot(storeId, userId);
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "Subscribed Successfully", i));
+  } catch (error) {
+    return res
+      .status(500)
+      .json(httpStatusResponse(500, (error as Error).message));
+  }
+};
+
+export const getOnBoardingFlows = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const TUTORIAL_VIDEO_SIZE = 12;
+
+    const [
+      { isEmailVerified, phoneNumber },
+      addPaymentMethod,
+      hasProduct,
+      tutorialsWatched,
+    ] = await Promise.all([
+      findUser(req.userId, true, { isEmailVerified: 1, phoneNumber: 1 }),
+      StoreBankAccountModel.exists({
+        storeId: req.storeId,
+        userId: req.userId,
+      }),
+      ProductModel.exists({ storeId: req.storeId }),
+      TutorialModel.countDocuments({
+        user: req.userId,
+        isCompleted: true,
+      }),
+    ]);
+
+    return res.status(200).json(
+      httpStatusResponse(200, undefined, {
+        isEmailVerified,
+        phoneNumber,
+        hasProduct: !!hasProduct,
+        addPaymentMethod,
+        tutorialVideoWatch: tutorialsWatched >= TUTORIAL_VIDEO_SIZE,
+      })
+    );
+  } catch (error) {
+    return res
+      .status(500)
+      .json(httpStatusResponse(500, (error as Error).message));
+  }
+};
+
+export const addBankAccount = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { accountNumber, nin, bankName, bankCode } = req.body;
+  } catch (error) {
+    return res
+      .status(500)
+      .json(httpStatusResponse(500, (error as Error).message));
+  }
+};
+
+export const getBanks = async (_: AuthenticatedRequest, res: Response) => {
+  try {
+    const banks = await getAvailableBanks();
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "Banks fetched successfully", banks.data));
+  } catch (error) {
+    return res
+      .status(500)
+      .json(httpStatusResponse(500, (error as Error).message));
+  }
+};
+
+export const getStoreBank = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { storeCode } = req.query;
+
+    const store = await findStore({ storeCode });
+
+    const bank = await StoreBankAccountModel.findOne({ storeId: store._id });
+
+    return res
+      .status(200)
+      .json(
+        httpStatusResponse(
+          200,
+          "BankAccount fetched successfully",
+          bank.toObject()
+        )
+      );
+  } catch (error) {
+    return res
+      .status(500)
+      .json(httpStatusResponse(500, (error as Error).message));
+  }
+};
+
+export const updateStoreBank = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const bankDetails = req.body;
+
+    const { storeId, userId } = req;
+
+    const bank = await StoreBankAccountModel.findOneAndUpdate({
+      storeId,
+      userId,
+    });
+
+    if (bank) {
+      bank.accountNumber = bankDetails.accountNumber;
+      bank.nin = bankDetails.nin;
+      bank.bankName = bankDetails.bankName;
+      bank.bankCode = bankDetails.bankCode;
+
+      await bank.save();
+    } else {
+      const newBank = new StoreBankAccountModel({
+        ...bankDetails,
+        storeId,
+        userId,
+      });
+
+      await newBank.save();
+    }
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "BankAccount updated successfully"));
+  } catch (error) {
+    return res
+      .status(500)
+      .json(httpStatusResponse(500, (error as Error).message));
+  }
+};
+
+export const addSendBoxApiKey = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { storeId, body } = req;
+    const { accessKey } = body;
+
+    const sendBox = new SendBox(storeId, accessKey, true);
+
+    await sendBox.saveSendBoxAccessKey();
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "SendBox API Key added successfully"));
+  } catch (error) {
+    console.log(error);
+    return res.status(500).json(httpStatusResponse(500, error.message));
+  }
+};
+
+export const deleteSendBoxApiKey = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { storeId } = req;
+
+    const sendBox = new SendBox(storeId, undefined, true);
+
+    await sendBox.deleteApiKeys();
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "KEY_DELETED_SUCCESSFULLY"));
+  } catch (error) {
+    return res.status(500).json(httpStatusResponse(500, error.message));
+  }
+};
+
+export const payWithBankAccount = async (req: Request, res: Response) => {
+  const { id, paymentFor = "order" } = req.body;
+  let order: IOrder;
+  const data = {
+    amount: 0,
+    details: { firstName: "", lastName: "", email: "", phoneNumber: "" },
+  };
+
+  if (paymentFor === "order") {
+    try {
+      order = await OrderModel.findById(id);
+      const { storeName } = await isStoreActive(order.storeId);
+
+      const { email, phoneNumber } = order.customerDetails;
+
+      data["amount"] = order.amountLeftToPay;
+      data["details"] = {
+        ...data["details"],
+        firstName: storeName,
+        email,
+        phoneNumber,
+      };
+    } catch (error) {
+      console.log(error);
+      return res.status(500).json(httpStatusResponse(500, error.message));
+    }
+  }
+
+  const payment = new PaymentService(data["amount"]);
+  try {
+    const { email } = data["details"];
+
+    await payment.startSession();
+
+    await payment.generateRef();
+
+    await payment.createVirtualAccount({
+      email,
+    });
+
+    await payment.createTransaction(id, paymentFor);
+
+    await payment.commitSession();
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, undefined, payment.virtualAccount));
+  } catch (error) {
+    console.error(error);
+    if (payment.session) {
+      await payment.cancelSession();
+    }
   }
 };

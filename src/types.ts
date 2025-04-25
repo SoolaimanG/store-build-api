@@ -140,7 +140,6 @@ export type IStore = {
   balance: number;
   owner: string;
   isActive: boolean;
-  paymentDetails?: IPaymentDetails;
   previewFor?: string;
   customizations?: {
     logoUrl: string;
@@ -249,11 +248,11 @@ export interface CardDetails {
 }
 
 export interface CustomerDetails {
-  _id?: string; // 216519823
-  name: string; // "Yemi Desola"
-  phone_number: string; // "N/A"
-  email: string; // "user@gmail.com"
-  created_at: string; // "2020-07-15T14:31:15.000Z"
+  _id?: string;
+  name: string;
+  phone_number: string;
+  email: string;
+  created_at: string;
 }
 
 export type ISubscription = {
@@ -317,7 +316,7 @@ export interface GetCustomersResponse {
 
 export type IOrderPaymentDetails = {
   paymentStatus: IPaymentStatus;
-  paymentMethod: "banktrf"; // Method used for payment
+  paymentMethod: string;
   transactionId?: string; // Unique ID for the payment transaction
   paymentDate?: string; // Date and time of payment
   paymentLink?: string;
@@ -363,6 +362,7 @@ export enum PATHS {
   STORE_INTEGRATIONS = "/store-integrations/",
   STORE = "/store/",
   STORE_COUPON = "/store/coupon/",
+  CONFIRM_FLUTTERWAVE_PAYMENT = "/flutterwave/payment/",
 }
 
 export type IShippingDetails = {
@@ -591,8 +591,8 @@ export type IChatBotIntegration = {
 };
 
 export type IDeliveryIntegration = {
-  nationWideDelivery: boolean;
-  selectedStates?: string[];
+  deliveryNationwide: boolean;
+  shippingRegions?: string[];
 };
 
 export type IUserActions = "ADD_PRODUCT" | "UPLOAD_VIDEO" | "USE_AI";
@@ -604,7 +604,7 @@ export type IMediaIntegration = {
 export type IntegrationProps = {
   isConnected: boolean;
   name: string;
-  settings:
+  settings?:
     | IChatBotIntegration
     | IDeliveryIntegration
     | IMediaIntegration
@@ -959,12 +959,26 @@ export type PickUpCreationResponse = {
   total_value: number;
 };
 
-export type ITransaction = {
+export interface ITransaction<T = any> extends ITimeStamp {
   txRef: string;
   paymentMethod: string;
   amount: number;
-  paymentStatus: string;
-  paymentFor: string;
+  paymentStatus: IPaymentStatus;
+  paymentFor: IPaymentFor;
+  _id?: string;
+  userId: string;
+  meta?: T;
+}
+
+export type IIntegrationSubscription = {
+  integrationId: string;
+  amountPaid: number;
+  expiredAt: string;
+  paymentChannel: "balance" | "checkout";
+  transactionId: string;
+  userId: string;
+  storeId: string;
+  isActive: boolean;
 } & ITimeStamp;
 
 // StoreBuild AI Configs
@@ -995,4 +1009,273 @@ export interface IChatBotConversation extends ITimeStamp {
   actionPerformed?: string;
   intent?: string;
   metadata?: Metadata;
+}
+
+export type IStoreBankAccounts = {
+  storeId: string;
+  accountNumber: string;
+  bankCode: string;
+  bankName: string;
+  accountName: string;
+  isDefault: boolean;
+  userId: string;
+  nin: string;
+} & ITimeStamp;
+
+export type IPaymentFor = "order" | "subscription" | "store-build-ai";
+
+export type virtualAccountCreationProps = {
+  type: "oneTimeAccount" | "dedicatedAccount";
+  storeId: string;
+  userId: string;
+  meta?: any;
+  paymentFor: IPaymentFor;
+  amount: number;
+  name: string;
+  email?: string;
+};
+
+export interface paymentAccountCreationProps<T = any> {
+  tx_ref: string;
+  orderId?: string;
+  amount: number;
+  storeId: string;
+  paymentFor: IPaymentFor;
+  subcriptionId?: string;
+  meta?: T;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export type budPayPayload = {
+  email: string;
+  amount: string;
+  currency: string;
+  reference: string;
+  name: string;
+};
+
+//FLUTTERWAVE TRANSACTION REQUEST
+type ICustomerDetails = {
+  email: string;
+  name?: string;
+  phonenumber?: string;
+};
+
+type Customizations = {
+  title?: string;
+  logo?: string;
+  description?: string;
+};
+
+type Subaccount = {
+  id: string; // Assuming ID is a string, update the type if needed.
+  [key: string]: any; // Optional extra fields for flexibility.
+};
+
+export interface TransactionRequest<T = any> {
+  tx_ref: string; // Unique reference code for the transaction.
+  amount: number; // Amount to charge the customer.
+  currency?: string; // Currency to charge in, defaults to "NGN".
+  redirect_url: string; // URL to redirect the customer after payment.
+  customer: ICustomerDetails; // Customer details (email is required).
+  session_duration?: number; // Duration in minutes, max 1440.
+  max_retry_attempt?: number; // Maximum retry attempts after failure.
+  customizations?: Customizations; // Options to customize payment modal.
+  meta?: T; // Extra information to store alongside the transaction.
+  payment_plan?: string; // Payment plan ID for recurring payments.
+  subaccounts?: Subaccount[]; // Array of subaccounts for payment splitting.
+  payment_options?: string[]; // Payment methods to be displayed.
+}
+
+export type FlutterwaveResponse = {
+  status: "success";
+  message: string;
+  data: {
+    link: string;
+  };
+};
+
+//SHIPMENT --> SendBox
+
+export interface State {
+  name: string;
+  code: string;
+}
+
+export interface Country {
+  name: string;
+  code: string;
+}
+
+export interface Status {
+  name: string;
+  code: string;
+}
+
+export interface PaymentData {
+  checkout_id: string;
+  status: string;
+  entity_id: null | string;
+  currency: string;
+  reference_code: string;
+  payment_source_code: null | string;
+  amount: number;
+}
+
+export interface ItemType {
+  name: string;
+  code: string;
+}
+
+export interface ShippingItem {
+  name: string;
+  weight: number;
+  quantity: number;
+  piece_id: string;
+  description: string;
+  item_type: ItemType;
+  value: number;
+}
+
+export interface Action {
+  name: string;
+  code: string;
+}
+
+export interface PackageType {
+  weight: number;
+  name: string;
+  description: string;
+}
+
+export interface IncomingOption {
+  name: null | string;
+  code: null | string;
+}
+
+export interface Merchant {
+  name: string;
+  email: string;
+  phone: string;
+}
+
+export interface Courier {
+  name: string;
+}
+
+export interface DeliveryPriority {
+  [key: string]: any; // This appears to be an empty object in the example
+}
+
+export interface PickupCourier {
+  [key: string]: any; // This appears to be an empty object in the example
+}
+
+export interface ShipmentResponse {
+  pickup_date: string;
+  has_waybill_error: boolean;
+  selected_courier_id: string;
+  origin_city: string;
+  pickup_courier: PickupCourier;
+  code: string;
+  recurrent_cards: any[]; // Empty array in the example
+  origin_name: string;
+  delivery_priority: DeliveryPriority;
+  origin_state: State;
+  package_invoice_image: null | string;
+  destination_state_name: string;
+  current_status: Status;
+  user_id: string;
+  destination_country: Country;
+  date_created: string;
+  weight: number;
+  paid: number;
+  pod: string;
+  destination_state_code: string;
+  payment_data: PaymentData;
+  destination_state: State;
+  destination_email: string;
+  origin_country: Country;
+  origin_state_code: string;
+  destination_country_name: string;
+  region: string;
+  status_code: string;
+  fee: number;
+  origin_country_name: string;
+  possible_actions: Action[];
+  tracking_code: string;
+  amount: number;
+  package_delivery_attempt: number;
+  _id: string;
+  origin_email: null | string;
+  insurance_option_code: string;
+  origin_state_name: string;
+  origin_street: string;
+  last_updated: string;
+  incoming_option: IncomingOption;
+  id: string;
+  merchant: Merchant;
+  pk: string;
+  package_connector_other_charge: number;
+  destination_city: string;
+  date_booked: string;
+  origin_phone: string;
+  destination_name: string;
+  current_awb: null | string;
+  courier: Courier;
+  origin_country_code: string;
+  destination_phone: string;
+  destination_street: string;
+  max_quoted_fee: number;
+  selected_courier: string;
+  min_quoted_fee: number;
+  waybill_error: string;
+  courier_id: string;
+  destination_country_code: string;
+  quantity: number;
+  total_value: number;
+}
+
+export interface FlutterwaveVirtualAccountResponse {
+  status: "success";
+  message: "Virtual account created";
+  data: {
+    response_code: string;
+    response_message: string;
+    flw_ref: string;
+    order_ref: string;
+    account_number: string;
+    account_status: "active" | "inactive";
+    frequency: 1;
+    bank_name: string;
+    created_at: string;
+    expiry_date: string;
+    note: string;
+    amount: string;
+  };
+}
+
+export interface BillStackWebHook {
+  event: "PAYMENT_NOTIFIFICATION";
+  data: {
+    type: "RESERVED_ACCOUNT_TRANSACTION";
+    reference: string;
+    merchant_reference: string;
+    wiaxy_ref: string;
+    amount: number;
+    created_at: string;
+    account: {
+      account_number: string;
+      account_name: string;
+      bank_name: string;
+      created_at: string;
+    };
+    payer: {
+      account_number: string;
+      first_name: string;
+      last_name: string;
+      createdAt: string;
+    };
+  };
 }

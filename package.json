@@ -30,7 +30,8 @@
     "query-string": "^9.1.1",
     "redis": "^4.7.0",
     "serverless-http": "^3.2.0",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "zod": "^3.24.2"
   },
   "devDependencies": {
     "@types/compression": "^1.7.5",
