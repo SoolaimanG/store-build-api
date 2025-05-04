@@ -2024,6 +2024,77 @@ function generateSubscriptionEmail({
   `;
 }
 
+function generateNameMismatchEmail(userName: string, verifiedName: string) {
+  const emailHtml = `
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Name Mismatch Notification</title>
+    <style>
+      body {
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        line-height: 1.6;
+        color: #333;
+        margin: 0;
+        padding: 0;
+      }
+      .container {
+        max-width: 600px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+      .header {
+        background-color: #0066cc;
+        padding: 20px;
+        text-align: center;
+      }
+      .header h1 {
+        color: white;
+        margin: 0;
+        font-size: 24px;
+      }
+      .content {
+        padding: 20px;
+        background-color: #ffffff;
+      }
+      .footer {
+        font-size: 12px;
+        color: #999;
+        text-align: center;
+        margin-top: 30px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <h1>Account Name Update</h1>
+      </div>
+      <div class="content">
+        <p>Hello \${userName},</p>
+
+        <p>We noticed that the name you provided did not match the name registered with your account. For your security and to ensure proper verification, we have updated your account name to:</p>
+
+        <h2 style="text-align: center; color: #0066cc;">\${verifiedName}
+        </h2>
+
+        <p>If you believe this update is incorrect or have any concerns, please contact our support team immediately.</p>
+
+        <p>Thank you for your understanding,<br>The Team</p>
+      </div>
+      <div class="footer">
+        <p>This is an automated email. Please do not reply to this message.</p>
+        <p>&copy; \${new Date().getFullYear()} Your Company. All rights reserved.</p>
+      </div>
+    </div>
+  </body>
+  </html>
+  `;
+  return emailHtml;
+}
+
 export {
   EmailType,
   generateEmail,
@@ -2032,4 +2103,5 @@ export {
   generateAdminOrderNotificationEmail,
   generateOrderCompletionEmail,
   generateSubscriptionEmail,
+  generateNameMismatchEmail,
 };

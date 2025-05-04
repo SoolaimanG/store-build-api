@@ -1,8 +1,5 @@
-import mongoose, { PipelineStage, Schema } from "mongoose";
+import mongoose, { PipelineStage } from "mongoose";
 import {
-  budPayPayload,
-  chargePayload,
-  chargeResponse,
   FlutterwaveResponse,
   IChatBotConversation,
   IChatBotIntegration,
@@ -17,28 +14,19 @@ import {
   IOrderProduct,
   IOrderStatus,
   IOTPFor,
-  IPaymentDetails,
-  IPaymentIntegration,
   IPlan,
   IProduct,
   IProductDimensions,
-  IReferral,
-  IShippingDetails,
   IStore,
   IStoreTheme,
-  ITransaction,
   IUser,
   IUserActions,
   OrderQuery,
-  paymentAccountCreationProps,
-  PickUpCreationResponse,
   ShipmentResponse,
   ShippingData,
   SignUpBody,
-  StoreActions,
   TransactionRequest,
   VerifyChargeResponse,
-  virtualAccountCreationProps,
 } from "./types";
 import {
   CategoryModel,
@@ -55,7 +43,6 @@ import {
   ReferralModel,
   StoreModel,
   StoreSttings,
-  TransactionModel,
   UserModel,
 } from "./models";
 import { Request, Response, NextFunction } from "express";
@@ -67,15 +54,10 @@ import {
   generateOrderEmail,
   getOrderStatusChangedEmailTemplate,
   getQuickEmailsTemplate,
-  otpEmailTemplate,
 } from "./emails";
 import axios from "axios";
 import {
-  aiFunctions,
   config,
-  DEFAULT_STORE_CONFIG,
-  getCustomerFunctionDeclarations,
-  getFunctionDeclarations,
   iconList,
   integrationIds,
   quickEmails,
@@ -90,6 +72,7 @@ import {
   SchemaType,
 } from "@google/generative-ai";
 import { LRUCache } from "lru-cache";
+import { Account, PaymentService, SendBox, Store } from "./server-utils";
 
 const MONGO_URI = config.MONGO_URI || "";
 
@@ -332,86 +315,12 @@ export const generateReferralCode = async () => {
   return referralCode;
 };
 
-export const createUser = async (
-  email: string,
-  discoveredUsBy: IDiscoveredUsBy,
-  fullName?: string,
-  session?: any
-) => {
-  const referralCode = await generateReferralCode();
-
-  const plan: IPlan = {
-    amountPaid: 0,
-    autoRenew: false,
-    expiredAt: null,
-    subscribedAt: null,
-    type: "free",
-  };
-
-  const user = await UserModel.create(
-    [
-      {
-        plan,
-        email,
-        fullName,
-        referralCode,
-        discoveredUsBy,
-        firstTimeUser: true,
-        isEmailVerified: false,
-      },
-    ],
-    { session }
-  );
-
-  return user[0];
-};
-
 export const cloneStore = async (templateId: string) => {
   const _store = await StoreModel.findOne({ templateId });
 
   if (!_store) return null;
 
   return _store.customizations;
-};
-
-export const createStore = async (
-  store: Partial<IStore>,
-  templateId?: string,
-  session?: any
-) => {
-  let storeCode = generateRandomString(6);
-
-  while (await StoreModel.exists({ storeCode })) {
-    storeCode = generateRandomString(6);
-  }
-
-  // Merge the provided `store` data with the default values
-  const storeData: IStore = {
-    ...DEFAULT_STORE_CONFIG,
-    ...store,
-    storeCode,
-    customizations: {
-      ...DEFAULT_STORE_CONFIG.customizations,
-      category: { showImage: false, header: "Categories" },
-    },
-  };
-
-  if (templateId) {
-    // Clone the store design
-    const store2Clone = await cloneStore(templateId);
-
-    if (!store2Clone) return;
-
-    storeData.customizations = {
-      ...store2Clone,
-      logoUrl: "",
-    };
-  }
-
-  // Create and save the new store document in MongoDB
-  const _store = await StoreModel.create([storeData], { session });
-
-  return _store[0];
 };
 
 export const generateToken = (
@@ -438,7 +347,7 @@ export const sendEmail = async (
 ) => {
   let configOptions: SMTPTransport | SMTPTransport.Options | string = {
     host: "smtp-relay.brevo.com",
-    port: 587,
+    port: 465,
     ignoreTLS: true,
     auth: {
       user: config.HOST_EMAIL,
@@ -543,102 +452,6 @@ export const validateOrderCreation = async (
     email: user.email,
     phoneNumber: user.phoneNumber,
   };
-};
-
-export const verifyOtp = async (token: string, userEmail: string) => {
-  const email = { $regex: userEmail, $options: "i" };
-
-  const user = await findUser({ email });
-
-  // Find and delete OTP in one query
-  const otp = await OTPModel.findOne({ token, user: user.id });
-
-  if (!otp) {
-    throw new Error("Invalid OTP or OTP has already been used.");
-  }
-
-  // Check if OTP is expired
-  if (Date.now() > otp.expiredAt) {
-    throw new Error("OTP has expired.");
-  }
-
-  if (otp.tokenFor === "verify-email" && user.isEmailVerified) {
-    throw new Error("Your email has already been verified, Thank you");
-  }
-
-  // Handle different OTP actions based on `tokenFor`
-  if (otp.tokenFor === "login") {
-    const store = await StoreModel.findOne({ owner: user.id });
-    await otp.deleteOne();
-    if (!store) {
-      throw new Error("Store not found.");
-    }
-
-    if (!user.isEmailVerified) {
-      user.isEmailVerified = true;
-    }
-
-    if (user.firstTimeUser) {
-      user.firstTimeUser = false;
-    }
-
-    // Generate and return token for login
-    return generateToken(user.id, user.email, store.id);
-  }
-
-  if (otp.tokenFor === "verify-email") {
-    await otp.deleteOne();
-    user.isEmailVerified = true;
-  }
-
-  await user.save();
-
-  return "OTP verified successfully.";
-};
-
-export const sendOTP = async (
-  tokenFor: IOTPFor,
-  _email: string,
-  storeName: string
-) => {
-  let token = generateOTP();
-
-  // Ensure unique OTP
-  while (await OTPModel.exists({ token })) {
-    token = generateOTP();
-  }
-
-  const email = { $regex: _email, $options: "i" };
-
-  // Retrieve user and their email
-  const user = await UserModel.findOne({ email });
-
-  if (!user) throw new Error("User not found.");
-
-  if (tokenFor == "verify-email" && user.isEmailVerified)
-    throw new Error("Your email has already been verified, Thank you");
-
-  // Retrieve or create OTP entry for the user
-  let otp = await OTPModel.findOne({ user: user.id });
-  if (!otp) {
-    otp = new OTPModel({ user: user.id });
-  }
-
-  // Update OTP data
-  otp.token = token;
-  otp.tokenFor = tokenFor;
-  otp.expiredAt = Date.now() + 10 * 60 * 1000;
-
-  // Send the OTP email
-  await sendEmail(
-    user.email,
-    otpEmailTemplate(token, storeName || "Store"),
-    undefined,
-    "Verify OTP"
-  );
-
-  // Save OTP to the database
-  await otp.save();
 };
 
 export async function getSalesData(storeId: string) {
@@ -1201,184 +1014,6 @@ export const areAllProductDigital = (products: IProduct[]) => {
   return products.every((product) => product.isDigital);
 };
 
-export const processOrder = async (
-  storeId: string,
-  order: Partial<IOrder>,
-  tx_ref: string,
-  couponCode?: string
-) => {
-  try {
-    // Create a new ObjectId properly
-    const _id = new mongoose.Types.ObjectId();
-
-    await isStoreActive(storeId);
-
-    if (!(order.customerDetails.email && order.customerDetails.phoneNumber)) {
-      throw new Error("Customer details must include email and phone number");
-    }
-
-    //Create the customer detail
-    const customerDetails: ICustomer & { shippingAddress: ICustomerAddress } = {
-      ...order.customerDetails,
-      email: order.customerDetails.email,
-      name: order.customerDetails.name,
-      phoneNumber: order.customerDetails.phoneNumber,
-    };
-
-    //Create the payment detail option
-    const paymentDetails: IOrderPaymentDetails = {
-      paymentDate: new Date().toISOString(),
-      paymentLink: "NIL",
-      paymentMethod: "NIL",
-      paymentStatus: "pending",
-      tx_ref,
-      transactionId: tx_ref,
-    };
-
-    const _products = order.products.map((p) => ({
-      size: p.size,
-      productId: p._id,
-      color: p.color,
-    }));
-
-    // Parallel execution of independent operations
-    const [amountRes, storeRes, integrationsRes] = await Promise.allSettled([
-      calculateTotalAmount(_products, couponCode),
-      validateOrderCreation(storeId, order),
-      fetchIntegrations(storeId),
-    ]);
-
-    const checkFulfilment =
-      amountRes.status === "rejected" ||
-      storeRes.status === "rejected" ||
-      integrationsRes.status === "rejected";
-
-    if (checkFulfilment) {
-      throw new Error("Something went wrong why trying to process your order");
-    }
-
-    const amount = amountRes.value;
-    const store = storeRes.value;
-    const integrations = integrationsRes.value;
-
-    let deliveryCost = 0;
-
-    //
-    if (order.deliveryType === "sendbox" && customerDetails) {
-      const res = await calculateDeliveryCost(
-        {
-          ...customerDetails,
-          shippingDetails: {
-            ...customerDetails.shippingAddress,
-          },
-        },
-        amount.totalAmount,
-        storeId,
-        order.products
-      );
-
-      const shippingPackageOption: Record<
-        typeof order.shippingDetails.shippingMethod,
-        0 | 1
-      > = {
-        EXPRESS: 0,
-        STANDARD: 1,
-      };
-
-      const option =
-        shippingPackageOption[
-          order?.shippingDetails?.shippingMethod || "STANDARD"
-        ];
-
-      const totalShippingCost = res.rates?.[option]?.fee;
-
-      deliveryCost = totalShippingCost;
-    }
-
-    const { flutterwaveIntegration } = integrations;
-
-    //    if (flutterwaveIntegration.integration?.isConnected) {
-    //      const { useCustomerDetails } = flutterwaveIntegration.integration
-    //        .settings as IPaymentIntegration;
-    //
-    //      if (!useCustomerDetails) {
-    //        customerDetails.email = store.email;
-    //        customerDetails.name = store.storeName;
-    //        customerDetails.phoneNumber = store.phoneNumber;
-    //      }
-    //
-    //      const flwPayload: TransactionRequest<{
-    //        storeId: string;
-    //        orderId: string;
-    //      }> = {
-    //        amount: order.amountLeftToPay,
-    //        customer: {
-    //          email: order.customerDetails.email,
-    //          name: order.customerDetails.name,
-    //          phonenumber: order.customerDetails.phoneNumber,
-    //        },
-    //        customizations: {
-    //          description: "",
-    //          logo: "",
-    //          title: "",
-    //        },
-    //        meta: {
-    //          storeId: order.storeId,
-    //          orderId: order._id,
-    //        },
-    //        payment_options: [],
-    //        payment_plan: "",
-    //        redirect_url: "",
-    //        tx_ref,
-    //      };
-    //
-    //      const charge = await createCharge(flwPayload);
-    //
-    //      paymentDetails.paymentLink = charge.data.link;
-    //    } else {
-    //      const err = new Error(
-    //        "This store does not have an active payment option, please message the store owner about this error"
-    //      );
-    //      throw err;
-    //    }
-
-    // Create order
-
-    const newOrder = new OrderModel({
-      ...order,
-      _id,
-      storeId,
-      paymentDetails,
-      orderStatus: "Pending",
-      amountLeftToPay: amount.totalAmount + deliveryCost,
-      totalAmount: amount.totalAmount + deliveryCost,
-      amountPaid: 0,
-      coupon: couponCode,
-      shippingDetails: {
-        ...order.shippingDetails,
-        shippingCost: deliveryCost,
-      },
-    });
-
-    await newOrder.save({ validateModifiedOnly: true });
-
-    try {
-      await handleOrderNotifications(
-        newOrder,
-        store.email,
-        store.storeCode,
-        store.customizations?.theme
-      );
-    } catch (error) {
-      console.log(error);
-    }
-
-    return newOrder;
-  } catch (error) {
-    throw error;
-  }
-};
-
 export const calculateProductReviewStats = async (productId: string) => {
   try {
     const [stats] = await RatingModel.aggregate([
@@ -1743,205 +1378,6 @@ export async function getOrderStats(storeId: string) {
   };
 }
 
-export const createPickup = async (
-  orderId: string,
-  storeId: string,
-  pickUpType: string,
-  estimatedDeliveryDate?: string
-) => {
-  if (!estimatedDeliveryDate) {
-    throw new Error("Invalid Date Type");
-  }
-
-  if (pickUpType === "pickup" && new Date() > new Date(estimatedDeliveryDate)) {
-    throw new Error(
-      "Pick up date cannot be a back date, Please use a valid date."
-    );
-  }
-
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
-  const endSession = async () => {
-    await session.abortTransaction();
-    session.endSession();
-  };
-
-  try {
-    if (!orderId || !storeId) throw new Error("Invalid orderId or storeId.");
-
-    const isValidObjectId = /^[a-fA-F0-9]{24}$/;
-    if (!isValidObjectId.test(orderId) || !isValidObjectId.test(storeId)) {
-      await endSession();
-      throw new Error("Invalid ID format.");
-    }
-
-    const [order, store] = await Promise.all([
-      OrderModel.findOne({ _id: orderId, storeId }, undefined, { session }),
-      StoreModel.findOne({ _id: storeId }, undefined, { session }).select(
-        "+balance"
-      ),
-    ]);
-
-    if (!order || !store) {
-      await endSession();
-      throw Error("Order or store not found.");
-    }
-
-    if (order.deliveryType !== "sendbox") {
-      await endSession();
-      throw new Error("Invalid delivery type.");
-    }
-
-    const user = await UserModel.findById(store.owner, undefined, { session });
-    if (!user) {
-      await endSession();
-      throw new Error("Store owner not found.");
-    }
-
-    const { storeAddress } = await StoreSttings.findOne(
-      { storeId },
-      { storeAddress: 1 },
-      { session }
-    );
-
-    const defaultAddress = storeAddress?.find((address) => address.isDefault);
-    if (!defaultAddress) {
-      await endSession();
-      throw new Error("No default address found.");
-    }
-
-    const customerDetails: ICustomer & {
-      shippingDetails: ICustomerAddress;
-    } = {
-      email: order.customerDetails.email,
-      name: order.customerDetails.name,
-      phoneNumber: order.customerDetails.phoneNumber,
-      shippingDetails: {
-        addressLine1: order.customerDetails.shippingAddress.addressLine1,
-        addressLine2: order.customerDetails.shippingAddress.addressLine2,
-        city: order.customerDetails.shippingAddress.city,
-        country: order.customerDetails.shippingAddress.country,
-        lat: 0,
-        lng: 0,
-        postalCode: order.customerDetails.shippingAddress.postalCode,
-        state: order.customerDetails.shippingAddress.state,
-      },
-    };
-
-    const dc = order.shippingDetails.shippingCost;
-
-    if (!dc) {
-      await endSession();
-      throw new Error("Failed to calculate delivery cost.");
-    }
-
-    console.log(store.balance, { dc });
-
-    if (store.balance < dc) {
-      await endSession();
-      throw new Error(
-        `Insufficient balance. Top up by ${formatAmountToNaira(
-          dc - store.balance
-        )}.`
-      );
-    }
-
-    const getDefaultDimension = (
-      products: IProduct[],
-      key: keyof IProductDimensions
-    ) =>
-      Math.max(
-        products.reduce((acc, curr) => acc + (curr.dimensions?.[key] || 0), 0),
-        1
-      );
-
-    const weight =
-      order.products?.reduce((acc, curr) => acc + (curr.weight || 0), 0) || 0;
-
-    if (weight <= 0) {
-      await endSession();
-      throw new Error("Invalid product weight.");
-    }
-
-    const items = order.products.map((p) => ({
-      name: p.productName,
-      description: p.description || "No description provided",
-      quantity: p.quantity || 1,
-      value: p.discount || p.price.default || 0,
-    }));
-
-    const dimensions = {
-      height: getDefaultDimension(order.products, "height"),
-      width: getDefaultDimension(order.products, "width"),
-      length: getDefaultDimension(order.products, "length"),
-    };
-
-    const pickUpPayload = {
-      origin: {
-        first_name: store.storeName,
-        last_name: store.storeName,
-        state: defaultAddress.state,
-        email: user.email,
-        city: defaultAddress.state,
-        country: "NG",
-        phone: user.phoneNumber,
-      },
-      destination: {
-        first_name: customerDetails.name,
-        last_name: customerDetails.name,
-        phone: customerDetails.phoneNumber,
-        state: customerDetails.shippingDetails.state,
-        email: customerDetails.email,
-        city: customerDetails.shippingDetails.state,
-        country: "NG",
-      },
-      weight,
-      dimension: dimensions,
-      incoming_option: pickUpType,
-      region: "NG",
-      service_type: "international",
-      package_type: "general",
-      total_value: order.totalAmount,
-      currency: "NGN",
-      channel_code: "api",
-      pickup_date: estimatedDeliveryDate, // Dynamically set pickup date
-      items,
-      service_code: "standard",
-      customs_option: "recipient",
-      callback_url: process.env.CALLBACK_URL || "",
-    };
-
-    const response = await axios.post(
-      "https://live.sendbox.co/shipping/shipments",
-      pickUpPayload,
-      {
-        headers: { Authorization: `Bearer ${config.SEND_BOX_ACCESS_TOKEN}` },
-      }
-    );
-
-    const { tracking_code } = response.data;
-    if (!tracking_code) {
-      await endSession();
-      throw new Error("Failed to retrieve tracking code.");
-    }
-
-    order.shippingDetails.trackingNumber = tracking_code;
-    store.balance -= dc;
-
-    await Promise.all([
-      order.save({ validateModifiedOnly: true }),
-      store.save({ validateModifiedOnly: true }),
-    ]);
-
-    await session.commitTransaction();
-    session.endSession();
-  } catch (error) {
-    await endSession();
-    throw error;
-  }
-};
-
 export const handleIntegrationConnection = async (
   storeId: string,
   integrationId: string,
@@ -2049,10 +1485,9 @@ export const handleIntegrationConnection = async (
   }
 };
 
-export class StoreBuildAI {
+export class StoreBuildAI extends Store {
+  //public userId?: string; // Changed from protected to public to match base class
   private systemPrompt: string;
-  private readonly storeId: string;
-  private readonly userId?: string;
   private chatBotName = "StoreBuild AI";
   private readonly sessionId: string;
   private readonly model: any;
@@ -2060,6 +1495,7 @@ export class StoreBuildAI {
   private actions: FunctionDeclaration[] = [];
   private userEmail?: string;
   public successProps: any;
+  //public storeId: string;
 
   // Add caching
   private static permissionsCache = new LRUCache({
@@ -2074,17 +1510,18 @@ export class StoreBuildAI {
 
   constructor(
     storeId?: string,
-    userId = "",
+    userId?: string,
     sessionId = "",
     isAdmin = false,
     userEmail?: string
   ) {
-    this.storeId = storeId;
-    this.userId = userId;
+    super();
     this.sessionId = sessionId || Date.now() + "";
     this.systemPrompt = "";
     this.isAdmin = isAdmin;
     this.userEmail = userEmail;
+    this.storeId = storeId;
+    this.userId = userId;
 
     const genAI = new GoogleGenerativeAI(process.env.GOOGLE_GEMINI_API_KEY!);
     this.model = genAI.getGenerativeModel({
@@ -3094,6 +2531,7 @@ export class StoreBuildAI {
   // This use gemini-API to generate response.
   private async generateResponse(prompt: string | string[]): Promise<string> {
     let response: string = "";
+
     try {
       this.queueMessage({
         actionPerformed: "None",
@@ -3110,6 +2548,9 @@ export class StoreBuildAI {
 
       const chatHistory = await this.getChatHistory();
       const formattedHistory = this.formatChatHistory(chatHistory);
+
+      const payment = new PaymentService(this.storeId);
+      const sendBox = new SendBox(this.storeId, true, true);
 
       // Public function declearations
       const funcDeclearations: FunctionDeclaration[] = [
@@ -3149,8 +2590,6 @@ export class StoreBuildAI {
       response = result.response.text();
 
       const _functionCall = result?.response?.functionCalls()?.[0];
-
-      console.log({ _functionCall });
 
       // Enhanced function detection and execution logic
       if (_functionCall) {
@@ -3434,7 +2873,7 @@ export class StoreBuildAI {
             break;
           case "subscribeToChat":
             try {
-              r = await subscribeForChatBot(this.storeId);
+              r = await payment.subscribeForAI();
             } catch (error) {
               return (error as Error).message;
             }
@@ -3459,11 +2898,13 @@ export class StoreBuildAI {
             break;
           case "createPickUp":
             try {
-              r = await createPickup(
+              r = await sendBox.createShipment(
+                {
+                  pickUpDate: _functionCall["args"]["pickUpType"],
+                  packageType: "general",
+                },
                 _functionCall["args"]["orderId"],
-                this.storeId,
-                _functionCall["args"]["pickUpType"],
-                _functionCall["args"]["estimatedDeliveryDate"]
+                true
               );
             } catch (error) {
               return (error as Error).message;
@@ -3478,26 +2919,23 @@ export class StoreBuildAI {
             break;
           case "generateStore":
             try {
-              const user = await createUser(
-                _functionCall["args"]["email"],
-                "referral",
-                _functionCall["args"]["fullName"]
-              );
+              const user = await this.createAccount({
+                email: _functionCall["args"]["email"],
+                fullName: _functionCall["args"]["fullName"],
+              });
 
-              await createStore(
-                {
-                  owner: user._id,
-                  storeName: _functionCall["args"]["storeName"],
-                  productType: _functionCall["args"]["productType"],
-                },
-                _functionCall["args"]["templateId"]
-              );
+              await this.createStore({
+                owner: user._id,
+                storeName: _functionCall["args"]["storeName"],
+                productType: _functionCall["args"]["productType"],
+                templateId: _functionCall["args"]["templateId"],
+              });
 
-              await sendOTP(
-                "login",
-                _functionCall["args"]["email"],
-                _functionCall["args"]["storeName"]
-              );
+              await this.sendOTP({
+                email: _functionCall["args"]["email"],
+                tokenFor: "login",
+                storeName: _functionCall["args"]["storeName"],
+              });
 
               this.successProps = { showVerifyOTPModal: true };
             } catch (error) {
@@ -3506,10 +2944,10 @@ export class StoreBuildAI {
             break;
           case "verifyOTP":
             try {
-              const message = await verifyOtp(
-                _functionCall["args"]["otp"],
-                this.userEmail
-              );
+              const message = await this.verifyOTP({
+                email: _functionCall["args"]["otp"],
+                token: this.userEmail,
+              });
 
               r = message;
             } catch (error) {
@@ -3858,58 +3296,6 @@ export const validateIntegrationSubscription = async (
   return subscription;
 };
 
-export const subscribeForChatBot = async (storeId: string, userId = "") => {
-  let _uId = userId;
-  const store = await StoreModel.findById(storeId).select("+balance");
-
-  if (!userId) {
-    const { _id } = await findUser(store.owner, true, { _id: 1 });
-    _uId = _id;
-  }
-
-  const now = new Date();
-
-  const FEE = Number(config["CHATBOT_SUBSCRIPTION_FEE"]) || 2000;
-
-  if (store.balance < FEE) {
-    throw new Error(
-      "INSUFFICIENT_FUNDS: Please add funds to your account and try again."
-    );
-  }
-
-  const _i = await validateIntegrationSubscription(storeId, "chatbot");
-
-  if (_i) {
-    throw new Error(
-      "You already have an active subscription to this integration."
-    );
-  }
-
-  now.setDate(now.getDate() + 30);
-
-  const transactionId = generateRandomString(20);
-
-  const i: IIntegrationSubscription = {
-    amountPaid: FEE,
-    integrationId: "chatbot",
-    paymentChannel: "balance",
-    storeId,
-    transactionId,
-    userId: _uId,
-    expiredAt: now.toISOString(),
-    isActive: true,
-  };
-
-  const __i = await IntegrationSubscriptionModel.create(i);
-
-  await Promise.allSettled([
-    handleIntegrationConnection(storeId, integrationIds[2], true),
-    store.updateOne({ balance: store.balance - FEE }),
-  ]);
-
-  return __i;
-};
-
 export const isProfileComplete = async (userId: string, storeId: string) => {
   // Check for emailVerification, checkIfUserHasAddAProduct, checkBankAccountVerification
 
@@ -3919,33 +3305,4 @@ export const isProfileComplete = async (userId: string, storeId: string) => {
   ]);
 
   return Boolean(user.isEmailVerified && productExist);
-};
-
-export const getAvailableBanks = async () => {
-  const res = await axios.get<{
-    status: boolean;
-    message: string;
-    data: [
-      {
-        name: string;
-        slug: string;
-        code: string;
-        longcode: string;
-        gateway: null;
-        pay_with_bank: boolean;
-        active: boolean;
-        is_deleted: boolean;
-        country: "Nigeria";
-        currency: "NGN";
-        type: string;
-        id: number;
-        createdAt: string;
-        updatedAt: string;
-      }
-    ];
-  }>(`https://api.paystack.co/bank?country=nigeria`, {
-    headers: { Authorization: `Bearer ${config.PAYSTACK_SECRET}` },
-  });
-
-  return res.data;
 };

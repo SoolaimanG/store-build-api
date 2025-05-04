@@ -1,4 +1,4 @@
-import { Request, response, Response } from "express";
+import { Request, Response } from "express";
 import {
   _createProduct,
   _editOrder,
@@ -12,44 +12,31 @@ import {
   calculatePercentageChange,
   calculateProductReviewStats,
   calculateTotalAmount,
-  checkMembershipAccess,
   createCharge,
   createOrderQuery,
-  createPickup,
-  createStore,
-  createUser,
   findOrder,
   findStore,
   findUser,
   formatAmountToNaira,
-  generateRandomString,
   generateToken,
-  getAvailableBanks,
   getOrderStats,
   getSalesData,
   handleIntegrationConnection,
   handleReferralLogic,
   httpStatusResponse,
-  isStoreActive,
-  processOrder,
   sendEmail,
-  sendOTP,
   sendQuickEmail,
   StoreBuildAI,
-  subscribeForChatBot,
   validateIconExistance,
-  validateProduct,
   validateSignUpInput,
-  verifyBank,
   verifyIntegration,
-  verifyOtp,
   verifyStore,
-  verifyStorePaymentOption,
 } from "./helper";
 import {
   AddressModel,
   CategoryModel,
   Coupon,
+  DedicatedAccountModel,
   IntegrationModel,
   OrderModel,
   ProductModel,
@@ -59,44 +46,43 @@ import {
   StoreBankAccountModel,
   StoreModel,
   StoreSttings,
-  SubscriptionModel,
   TransactionModel,
   TutorialModel,
   UserModel,
 } from "./models";
 import {
-  chargePayload,
   Customer,
   CustomerStats,
   GetCustomersQuery,
+  getProductFilters,
   ICheckFor,
   ICoupon,
   ICustomer,
   ICustomerAddress,
-  IGender,
   IOrder,
   IOrderProduct,
   IOrderStatus,
-  IPaymentDetails,
-  IPlan,
   IProduct,
   IRating,
   IStore,
   ITutorial,
-  IUser,
   SignUpBody,
   TransactionRequest,
 } from "./types";
 import { AuthenticatedRequest } from "./middle-ware";
 import { addDays, format, isAfter } from "date-fns";
-import mongoose, { PipelineStage } from "mongoose";
+import { PipelineStage } from "mongoose";
 import { EmailType, generateEmail } from "./emails";
-import { config, quickEmails, referralPipeLine, themes } from "./constant";
+import { quickEmails, referralPipeLine, themes } from "./constant";
 import ExcelJS from "exceljs";
 import {
+  Account,
+  Order,
   PaymentService,
+  Product,
   restrictPropertyModification,
   SendBox,
+  Store,
 } from "./server-utils";
 
 export const joinNewsLetter = async (req: Request, res: Response) => {
@@ -130,44 +116,34 @@ export const getProductTypes = async (_: Request, res: Response) => {
 };
 
 export const signUp = async (req: Request, res: Response) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
+  const store = new Store();
+
   try {
     const { email, storeName, fullName, referralCode, productType } =
       req.body as SignUpBody;
+
+    await store.startSession();
 
     // Validate input
     const validationError = validateSignUpInput(req.body);
 
     // If the validation fails throw an error
     if (validationError) {
-      await session.abortTransaction();
-      session.endSession();
       return res.status(400).json(httpStatusResponse(400, validationError));
     }
 
-    // Create user in database
-    const user = await createUser(email, "referral", fullName, session);
+    const user = await store.createAccount({ email, fullName });
 
-    const store = await createStore(
-      {
-        owner: user._id,
-        storeName,
-        productType,
-      },
-      undefined,
-      session
-    );
+    await store.createStore({ owner: user._id, productType, storeName });
 
     await handleReferralLogic(referralCode, user._id as string);
 
-    await session.commitTransaction();
-    session.endSession();
+    await store.commitSession();
 
     // Send OTP and generate token concurrently
     const [_, token] = await Promise.all([
-      sendOTP("verify-email", user.email, fullName),
-      generateToken(user._id as string, user.email, store._id),
+      store.sendOTP({ tokenFor: "verify-email", email: user.email }),
+      generateToken(user._id as string, user.email, store.store._id),
     ]);
 
     // Respond to client
@@ -177,8 +153,7 @@ export const signUp = async (req: Request, res: Response) => {
         httpStatusResponse(200, "Account Created Successfully", { user, token })
       );
   } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
+    await store.cancelSession();
     const _error = error as Error;
     return res.status(500).json(httpStatusResponse(500, _error.message));
   }
@@ -219,26 +194,19 @@ export const doesEmailOrStoreExist = async (req: Request, res: Response) => {
   }
 };
 
-export const _getBanks = async (_: Request, res: Response) => {
+export const verifyAccountNumber = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
   try {
-    const banks: string[] = [];
-
-    return res.status(200).json(httpStatusResponse(200, undefined, banks));
-  } catch (error) {
-    const err = error as Error;
-    console.log(err);
-    return res.status(500).json(httpStatusResponse(500, err.message));
-  }
-};
-
-export const verifyAccountNumber = async (req: Request, res: Response) => {
-  try {
-    const { accountBank, accountNumber } = req.query as undefined as {
-      accountBank: string;
+    const { bankCode, accountNumber } = req.query as undefined as {
+      bankCode: string;
       accountNumber: string;
     };
 
-    const data = await verifyBank(accountNumber, accountBank);
+    const provider = new PaymentService(req.storeId);
+
+    const data = await provider.verifyBank(accountNumber, bankCode);
 
     return res.status(200).json(httpStatusResponse(200, undefined, data));
   } catch (error) {
@@ -254,163 +222,17 @@ export const welcomeHome = async (req: Request, res: Response) => {
     .json(httpStatusResponse(200, "Welcome to Store Build"));
 };
 
-// This Routes Are For Store Owners
-export const verifySubscription = async (
-  req: AuthenticatedRequest,
-  res: Response
-) => {
-  try {
-    const session = await mongoose.startSession();
-    session.startTransaction();
-
-    const { query } = req;
-
-    const { tx_ref } = query as unknown as {
-      tx_ref: string;
-      autoRenew: boolean;
-    };
-
-    const trxAlreadyVerified = await SubscriptionModel.findOne({ tx_ref });
-
-    if (!trxAlreadyVerified || trxAlreadyVerified.status === "paid") {
-      await session.abortTransaction();
-      session.endSession();
-      return res
-        .status(400)
-        .json(
-          httpStatusResponse(
-            400,
-            "Looks like this transaction has already been verified or does not exist, Please contact support if you think this is a mistake"
-          )
-        );
-    }
-
-    let response, user;
-
-    try {
-      response = await _verifyTransaction<{
-        userId: string;
-        autoRenew: boolean;
-      }>(tx_ref);
-    } catch (error) {
-      await session.abortTransaction();
-      session.endSession();
-    }
-
-    try {
-      user = await findUser(response.data.data.metadata.userId);
-    } catch {
-      await session.abortTransaction();
-      session.endSession();
-    }
-
-    const { data } = response.data;
-
-    const amountPaid = data.amount;
-    const subscriptionFee = config.SUBCRIPTION_FEE;
-    const daysPerMonth = 30;
-
-    // Calculate additional days
-    const totalDays = Math.floor((amountPaid / subscriptionFee) * daysPerMonth);
-
-    // Calculate expiry date
-    const subscribedAt = new Date(data.created_at);
-    const expiredAt = addDays(subscribedAt, totalDays).toISOString(); // Adds total days to the subscription start date
-
-    const plan: IPlan = {
-      autoRenew: data.metadata.autoRenew || false,
-      amountPaid,
-      subscribedAt: subscribedAt.toISOString(),
-      expiredAt,
-      type: "premium",
-    };
-
-    // Update the user's plan
-    user.plan = plan;
-    await user.save({ session });
-
-    await SubscriptionModel.create(
-      [
-        {
-          amountPaid: plan.amountPaid,
-          paymentType: data.channel,
-          tx_ref,
-          user: user._id,
-        },
-      ],
-      { session }
-    );
-
-    await TransactionModel.create(
-      [
-        {
-          amount: amountPaid,
-          paymentFor: "subcriptionPayment",
-          paymentMethod: response.data.data.channel,
-          paymentStatus: response.data.data.status,
-          txRef: user.id,
-        },
-      ],
-      { session }
-    );
-
-    return res
-      .status(200)
-      .json(httpStatusResponse(200, "Subscription verified successfully"));
-  } catch (error) {
-    const _error = error as Error;
-    return res.status(500).json(httpStatusResponse(500, _error.message));
-  }
-};
-
-export const initiateChargeForSubscription = async (
-  req: AuthenticatedRequest,
-  res: Response
-) => {
-  try {
-    const { userId: user, userEmail: email, body } = req;
-
-    const { autoRenew = false, months = 1 } = body as {
-      autoRenew: boolean;
-      months: number;
-    };
-
-    const tx_ref = `TX-${generateRandomString(11)}`;
-
-    //@ts-ignore
-    const payload: TransactionRequest = {};
-
-    const charge = await createCharge(payload);
-
-    const subscription = new SubscriptionModel({
-      status: "pending",
-      tx_ref,
-      user,
-    });
-
-    await subscription.save();
-
-    return res
-      .status(200)
-      .json(
-        httpStatusResponse(
-          200,
-          "A charge has been initiated for you to make payment for your subcription.",
-          charge
-        )
-      );
-  } catch (error) {
-    const err = error as Error;
-    return res.status(500).json(httpStatusResponse(500, err.message));
-  }
-};
-
 export const verifyToken = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { otp, email } = req.body;
     const { userEmail } = req;
 
-    const message = await verifyOtp(otp, userEmail || email);
+    const account = new Account();
+
+    const message = await account.verifyOTP({
+      token: otp,
+      email: userEmail ?? email,
+    });
 
     return res
       .status(200)
@@ -421,11 +243,13 @@ export const verifyToken = async (req: AuthenticatedRequest, res: Response) => {
   }
 };
 
-export const _sendOTP = async (req: AuthenticatedRequest, res: Response) => {
+export const sendOTP = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { tokenFor, email, storeName } = req.body;
 
-    await sendOTP(tokenFor, req.userEmail || email, storeName);
+    const account = new Account();
+
+    await account.sendOTP({ email, tokenFor, storeName });
 
     return res
       .status(200)
@@ -630,214 +454,16 @@ export const getOrders = async (req: AuthenticatedRequest, res: Response) => {
 
 export const getProducts = async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { storeId: sId, query } = req;
-    const {
-      q,
-      sort = "default",
-      category,
-      minPrice,
-      maxPrice,
-      size = 20,
-      storeId: _sId,
-      productsToShow,
-      colors,
-      sizes,
-      gender,
-      rating,
-      isActive,
-    } = query as unknown as {
-      q?: string;
-      sort?: "default" | "stock-level" | "low-to-high" | "high-to-low";
-      category?: string;
-      minPrice?: string;
-      maxPrice?: string;
-      size?: number;
-      storeId: string;
-      productsToShow?: string;
-      colors?: string[];
-      sizes?: string[];
-      gender?: IGender[];
-      rating?: number;
-      isActive?: boolean;
-    };
+    const { storeId: sId, query, userId } = req;
+    const { storeId: _sId, ...filters } = query as unknown as getProductFilters;
 
     const storeId = sId || _sId;
-    let matchStage: any = { storeId };
 
-    // Text search filter
-    if (q) {
-      matchStage.$or = [
-        { productName: { $regex: q, $options: "i" } },
-        { description: { $regex: q, $options: "i" } },
-        { tags: { $regex: q, $options: "i" } },
-      ];
-    }
+    const products = new Product(storeId, userId);
 
-    // Basic filters
-    if (category) matchStage.category = category;
-    if (typeof isActive === "boolean") matchStage.isActive = isActive;
+    const resp = await products.getProducts({ ...filters, storeId });
 
-    // Color filter
-    if (colors && colors.length > 0) {
-      matchStage["availableColors.name"] = {
-        $in: Array.isArray(colors) ? colors : [colors],
-      };
-    }
-
-    // Size filter
-    if (Array.isArray(sizes) && sizes.length > 0) {
-      matchStage.availableSizes = { $in: sizes };
-    }
-
-    // Gender filter
-    if (Array.isArray(gender) && gender.length > 0) {
-      matchStage.gender = { $in: gender };
-    }
-
-    // Rating filter
-    if (rating) {
-      matchStage["ratings.average"] = { $gte: Number(rating) };
-    }
-
-    // Price range filter
-    if (minPrice || maxPrice) {
-      matchStage["price.default"] = {};
-      if (minPrice) matchStage["price.default"].$gte = parseFloat(minPrice);
-      if (maxPrice) matchStage["price.default"].$lte = parseFloat(maxPrice);
-    }
-
-    const limit = Math.max(1, Number(size) || 10);
-    const pipeline: any[] = [{ $match: matchStage }];
-
-    // Sorting logic
-    if (productsToShow) {
-      switch (productsToShow) {
-        case "random":
-          pipeline.push({ $sample: { size: limit } });
-          break;
-        case "best-sellers":
-          pipeline.push({ $match: { stockQuantity: { $gt: 0 } } });
-          pipeline.push({ $sort: { stockQuantity: -1 } });
-          break;
-        case "expensive":
-          pipeline.push({ $sort: { "price.default": -1 } });
-          break;
-        case "discounted":
-          pipeline.push({ $match: { discount: { $gt: 0 } } });
-          break;
-        default:
-          break;
-      }
-    } else {
-      let sortOrder: any = {};
-      switch (sort) {
-        case "stock-level":
-          sortOrder.stockQuantity = -1;
-          break;
-        case "low-to-high":
-          sortOrder["price.default"] = 1;
-          break;
-        case "high-to-low":
-          sortOrder["price.default"] = -1;
-          break;
-        default:
-          sortOrder.createdAt = -1;
-      }
-      pipeline.push({ $sort: sortOrder });
-    }
-
-    pipeline.push({ $limit: limit });
-
-    // Execute main query
-    const products = await ProductModel.aggregate(pipeline);
-
-    // Aggregations for filters and metrics
-    const [
-      totalProducts,
-      allColors,
-      allSizes,
-      priceStats,
-      ratingsDistribution,
-    ] = await Promise.all([
-      ProductModel.countDocuments({ storeId }),
-      ProductModel.aggregate([
-        { $match: { storeId } },
-        { $unwind: "$availableColors" },
-        {
-          $group: {
-            _id: null,
-            colors: { $addToSet: "$availableColors" },
-          },
-        },
-      ]),
-      ProductModel.aggregate([
-        { $match: { storeId } },
-        { $unwind: "$availableSizes" },
-        {
-          $group: {
-            _id: null,
-            sizes: { $addToSet: "$availableSizes" },
-          },
-        },
-      ]),
-      ProductModel.aggregate([
-        { $match: { storeId } },
-        {
-          $group: {
-            _id: null,
-            minPrice: { $min: "$price.default" },
-            maxPrice: { $max: "$price.default" },
-          },
-        },
-      ]),
-      ProductModel.aggregate([
-        { $match: { storeId } },
-        {
-          $group: {
-            _id: { $floor: "$ratings.average" },
-            count: { $sum: 1 },
-          },
-        },
-        { $sort: { _id: -1 } },
-      ]),
-    ]);
-
-    // Metrics for authenticated users
-    let productsMetricsResponse;
-    if (sId) {
-      const [digitalProducts, lowStockProducts, outOfStockProducts] =
-        await Promise.all([
-          ProductModel.countDocuments({ storeId, isDigital: true }),
-          ProductModel.countDocuments({
-            storeId,
-            stockQuantity: { $gt: 0, $lt: 10 },
-          }),
-          ProductModel.countDocuments({ storeId, stockQuantity: 0 }),
-        ]);
-      productsMetricsResponse = {
-        digitalProducts,
-        lowStockProducts,
-        outOfStockProducts,
-      };
-    }
-
-    const { minPrice: storeMinPrice, maxPrice: storeMaxPrice } =
-      priceStats[0] || { minPrice: 0, maxPrice: 0 };
-
-    const response = httpStatusResponse(200, undefined, {
-      totalProducts,
-      products,
-      filters: {
-        priceRange: { min: storeMinPrice, max: storeMaxPrice },
-        allColors: allColors[0]?.colors || [],
-        allSizes: allSizes[0]?.sizes || [],
-        ratingsDistribution: ratingsDistribution.reduce((acc, curr) => {
-          acc[curr._id] = curr.count;
-          return acc;
-        }, {}),
-      },
-      ...productsMetricsResponse,
-    });
+    const response = httpStatusResponse(200, undefined, resp);
 
     return res.status(200).json(response);
   } catch (error) {
@@ -971,37 +597,18 @@ export const createOrEditProduct = async (
     // Check for existing product in a single query
     const existingProduct = await ProductModel.findById(product._id);
 
-    const isDigitalProduct = existingProduct.isDigital || body.isDigital;
+    const p = new Product(storeId, userId);
 
-    if (isDigitalProduct) {
-      return res
-        .status(400)
-        .json(httpStatusResponse(400, "Digital product are not available"));
-    }
+    p.setProduct = product;
 
-    // Check if user can create new Product
-    if (!existingProduct) {
-      await checkMembershipAccess(userId, "ADD_PRODUCT", storeId);
-    }
+    await p.canUserAddMoreProducts();
 
-    // Validate the product first
-    await validateProduct({
-      ...product,
-      storeId,
-    });
+    await p.validateProduct();
 
     if (existingProduct) {
-      product = await _editProduct({
-        ...product,
-        storeId,
-      });
+      await p.editProduct();
     } else {
-      checkMembershipAccess(userId, "ADD_PRODUCT", storeId);
-      product = await _createProduct({
-        ...product,
-        _id: undefined,
-        storeId,
-      });
+      await p.addProduct();
     }
 
     const message = existingProduct
@@ -1033,6 +640,7 @@ export const calculateProductPrice = async (req: Request, res: Response) => {
   }
 };
 
+//TODO: rewrite this code.
 export const _calculateDeliveryCost = async (req: Request, res: Response) => {
   try {
     const { products, address, email, name, phoneNumber, couponCode } =
@@ -1212,50 +820,25 @@ export const deleteCategory = async (
 
 export const createOrder = async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const {
-      storeId: sId,
-      order,
-      couponCode,
-    } = req.body as {
+    const { order: orderData, couponCode } = req.body as {
       storeId: string;
       order: Partial<IOrder>;
       couponCode?: string;
     };
-    const storeId = req.storeId || sId;
-    const tx_ref = `TX-${generateRandomString(11)}`;
+    const storeId = orderData?.storeId || req.storeId;
 
-    // Basic input validation
-    if (!storeId || !order) {
-      return res
-        .status(400)
-        .json(
-          httpStatusResponse(
-            400,
-            "Missing required fields: storeId or order details"
-          )
-        );
-    }
+    const order = new Order(storeId);
 
-    const newOrder = await processOrder(storeId, order, tx_ref, couponCode);
-
-    return res
-      .status(200)
-      .json(httpStatusResponse(200, undefined, newOrder.toObject()));
-  } catch (error) {
-    const err = error as Error;
-    const statusCode = 500;
-    const errorMessage =
-      err.message || "An error occurred while creating the order";
-
-    console.error("Order creation failed:", {
-      error: err,
-      storeId: req.body.storeId || req.storeId,
-      timestamp: new Date().toISOString(),
+    const newOrder = await order.createOrder({
+      ...orderData,
+      coupon: couponCode,
     });
 
-    return res
-      .status(statusCode)
-      .json(httpStatusResponse(statusCode, errorMessage));
+    return res.status(200).json(httpStatusResponse(200, undefined, newOrder));
+  } catch (error) {
+    const err = error as Error;
+
+    return res.status(500).json(httpStatusResponse(500, err.message));
   }
 };
 
@@ -1307,13 +890,12 @@ export const getIntegration = async (
     }).select("+integration.apiKeys");
 
     const hasApiKeys = Boolean(
-      integration.integration.apiKeys["accessKey"] ||
-        integration.integration.apiKeys["token"]
+      integration?.integration?.apiKeys?.["accessKey"] ||
+        integration?.integration?.apiKeys?.["token"]
     );
 
-    const {
-      integration: { apiKeys, ...i },
-    } = integration.toObject();
+    const { integration: { apiKeys, ...i } = {} } =
+      integration?.toObject() || {};
 
     const INTEGRATION = {
       integration: { ...i },
@@ -1322,6 +904,7 @@ export const getIntegration = async (
 
     return res.status(200).json(httpStatusResponse(200, "", INTEGRATION));
   } catch (error) {
+    console.log(error);
     const err = error as Error;
     return res.status(500).json(httpStatusResponse(500, err.message));
   }
@@ -1364,17 +947,20 @@ export const getProduct = async (req: Request, res: Response) => {
   try {
     const { productId } = req.params;
 
-    const product = await ProductModel.findById(productId);
+    const product = new Product();
+
+    await product.getProduct(productId);
 
     const reviewStats = await calculateProductReviewStats(productId);
 
     return res.status(200).json(
       httpStatusResponse(200, undefined, {
-        ...product.toObject(),
+        ...product.product,
         ...reviewStats,
       })
     );
   } catch (error) {
+    console.log(error);
     const err = error as Error;
     return res.status(500).json(httpStatusResponse(500, err.message));
   }
@@ -1396,7 +982,7 @@ export const getProductWithIds = async (req: Request, res: Response) => {
 export const getOrder = async (req: Request, res: Response) => {
   try {
     const { orderId } = req.params;
-    const { phoneNumber } = req.query;
+    const { phoneNumber } = req.query as unknown as { phoneNumber: string };
 
     if (!phoneNumber) {
       return res
@@ -1411,30 +997,15 @@ export const getOrder = async (req: Request, res: Response) => {
         );
     }
 
-    const order = await OrderModel.findOne({
-      _id: orderId,
-      "customerDetails.phoneNumber": phoneNumber,
-    });
+    const orderService = new Order();
 
-    if (!order) {
-      return res
-        .status(404)
-        .json(
-          httpStatusResponse(404, "Order not found", undefined, "orderNotFound")
-        );
-    }
+    const order = await orderService.getOrder(orderId, phoneNumber);
 
-    const store = await findStore(order.storeId);
+    const store = await orderService.getStore();
 
-    const { phoneNumber: _phoneNumber, email } = await findUser(
-      store.owner,
-      true,
-      { phoneNumber: 1, email: 1 }
+    const { phoneNumber: _phoneNumber, email } = await orderService.getUser(
+      store.owner
     );
-
-    if (order?.shippingDetails?.trackingNumber) {
-      // Get the tracking history of the order
-    }
 
     return res.status(200).json(
       httpStatusResponse(200, "order fetched successfully", {
@@ -1475,6 +1046,7 @@ export const getInvoice = async (req: AuthenticatedRequest, res: Response) => {
     const store = await findStore(order.storeId, true, {
       storeName: 1,
       _id: 1,
+      storeCode: 1,
     });
     const storeOwner = await findUser(store.owner, true, { phoneNumber: 1 });
 
@@ -1508,6 +1080,8 @@ export const getInvoice = async (req: AuthenticatedRequest, res: Response) => {
       status: order.orderStatus,
       items: order.products,
       shippingDetails: order.shippingDetails,
+      storeCode: store.storeCode,
+      txRef: order.paymentDetails.tx_ref,
     };
 
     return res.status(200).json(httpStatusResponse(200, undefined, resp));
@@ -1537,44 +1111,11 @@ export const editOrderForCustomer = async (req: Request, res: Response) => {
     const { phoneNumber, updates } = req.body;
     const { orderId } = req.params;
 
-    //These are the list of properties that are not allow to be changed.
-    const restrictedUpdates = [
-      "orderStatus",
-      "paymentDetails",
-      "paymentStatus",
-      "createdAt",
-      "updatedAt",
-      "shippingDetails",
-      "totalAmount",
-      "storeId",
-      "amountLeftToPay",
-      "amountPaid",
-      "coupon",
-    ];
+    const orderService = new Order();
 
-    const order = await OrderModel.findOne({
-      _id: orderId,
-      "customerDetails.phoneNumber": phoneNumber,
-    });
+    await orderService.editOrder(orderId, phoneNumber, updates, false);
 
-    if (!order) {
-      return res.status(404).json(httpStatusResponse(404, "Order not found"));
-    }
-
-    restrictPropertyModification(updates, restrictedUpdates);
-
-    const newOrder = await order.updateOne(
-      {
-        $set: updates,
-      },
-      {
-        new: true,
-      }
-    );
-
-    return res
-      .status(200)
-      .json(httpStatusResponse(200, "Order updated", newOrder));
+    return res.status(200).json(httpStatusResponse(200, "Order updated"));
   } catch (error) {
     return res.status(500).json(httpStatusResponse(500, error.message));
   }
@@ -2115,22 +1656,18 @@ export const editStore = async (req: AuthenticatedRequest, res: Response) => {
 export const getStore = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { storeId, query, userId } = req;
-    const { storeCode } = query;
-    let beActive = false;
+    const { storeCode } = query as unknown as { storeCode: string };
 
-    let store: IStore | null = null;
+    let store: IStore;
+
+    const account = new Store(storeId, userId);
 
     if (storeCode) {
-      const _store = await findStore({ storeCode }, false);
-      store = _store?.toObject();
+      const resp = await account.previewStore(storeCode);
 
-      // Validate if the store preview time is still active or has expired
-      const now = new Date();
-      const previewTime = new Date(store.previewFor);
+      store = resp.store;
 
-      const isActive = Boolean(store.isActive && userId);
-
-      if (now > previewTime && isActive) {
+      if (resp.action === "expired") {
         return res
           .status(400)
           .json(
@@ -2141,25 +1678,21 @@ export const getStore = async (req: AuthenticatedRequest, res: Response) => {
           );
       }
 
-      beActive = isActive;
-    } else {
-      const _store = await StoreModel.findById(storeId).select(
-        "+paymentDetails +balance"
-      );
-
-      store = _store?.toObject();
-      beActive = true;
+      if (resp.action === "not-active") {
+        return res
+          .status(400)
+          .json(httpStatusResponse(1100, "Store is not active."));
+      }
     }
 
-    if (!beActive) {
-      return res
-        .status(400)
-        .json(httpStatusResponse(1100, "Store is not active."));
+    if (!storeCode && storeId) {
+      store = await findStore(storeId);
     }
 
     return res.status(200).json(httpStatusResponse(200, undefined, store));
   } catch (error) {
     const err = error as Error;
+    console.log(err);
     return res.status(500).json(httpStatusResponse(500, err.message));
   }
 };
@@ -2722,22 +2255,22 @@ export const verifyTransaction = async (req: Request, res: Response) => {
 };
 
 export const verifyBillStackPayment = async (req: Request, res: Response) => {
-  const payment = new PaymentService();
-
-  try {
-    const signature = req.headers["x-wiaxy-signature"] as string;
-    const payload: any = {};
-
-    await payment.startSession();
-    await payment.verifyBillStackPayment(signature, payload);
-    await payment.commitSession();
-
-    return res
-      .status(200)
-      .json(httpStatusResponse(200, "Payment verified successfully"));
-  } catch (error) {
-    await payment.cancelSession();
-  }
+  //  const payment = new PaymentService();
+  //
+  //  try {
+  //    const signature = req.headers["x-wiaxy-signature"] as string;
+  //    const payload: any = {};
+  //
+  //    await payment.startSession();
+  //    await payment.verifyBillStackPayment(signature, payload);
+  //    await payment.commitSession();
+  //
+  //    return res
+  //      .status(200)
+  //      .json(httpStatusResponse(200, "Payment verified successfully"));
+  //  } catch (error) {
+  //    await payment.cancelSession();
+  //  }
 };
 
 export const getSalesChartData = async (
@@ -2783,7 +2316,16 @@ export const createDeliveryPickupForOrder = async (
     const { storeId } = req;
     const { type, estimatedDeliveryDate } = req.body;
 
-    await createPickup(orderId, storeId, type, estimatedDeliveryDate);
+    const sendBox = new SendBox(storeId, true, true);
+
+    await sendBox.createShipment(
+      {
+        packageType: type,
+        pickUpDate: estimatedDeliveryDate,
+      },
+      orderId,
+      true
+    );
 
     return res
       .status(200)
@@ -2797,27 +2339,18 @@ export const createDeliveryPickupForOrder = async (
 
 export const updateUser = async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { userId, body } = req;
-    const { fullName, email, phoneNumber, tutorialVideoWatch } = body;
+    const { userId, body, storeId } = req;
 
-    const user = await findUser(userId);
+    const account = new Account(storeId, userId);
 
-    console.log(user);
-
-    user.fullName = fullName || user.fullName;
-    user.email = email || user.email;
-    user.phoneNumber = phoneNumber || user.phoneNumber;
-    user.tutorialVideoWatch = tutorialVideoWatch || user.tutorialVideoWatch;
-
-    const newUser = await user.save({ validateModifiedOnly: true });
+    await account.updateUser(body);
 
     return res
       .status(200)
       .json(
         httpStatusResponse(
           200,
-          "Your profile has been updated successfully",
-          newUser
+          "USER_PROFILE_UPDATED_SUCCESSFULLY: Your data has been updated successfully"
         )
       );
   } catch (error) {
@@ -3170,25 +2703,6 @@ export const aiStoreAssistant = async (
   }
 };
 
-export const _subscribeToChatBot = async (
-  req: AuthenticatedRequest,
-  res: Response
-) => {
-  try {
-    const { storeId, userId } = req;
-
-    const i = await subscribeForChatBot(storeId, userId);
-
-    return res
-      .status(200)
-      .json(httpStatusResponse(200, "Subscribed Successfully", i));
-  } catch (error) {
-    return res
-      .status(500)
-      .json(httpStatusResponse(500, (error as Error).message));
-  }
-};
-
 export const getOnBoardingFlows = async (
   req: AuthenticatedRequest,
   res: Response
@@ -3235,22 +2749,34 @@ export const addBankAccount = async (
   res: Response
 ) => {
   try {
-    const { accountNumber, nin, bankName, bankCode } = req.body;
+    const { accountNumber, nin, bankCode, bankName } = req.body;
+
+    const account = new Account(req.storeId, req.userId);
+
+    await account.connectBank(accountNumber, bankCode, nin, bankName);
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "Account Added Successfully."));
   } catch (error) {
+    console.log(error);
     return res
       .status(500)
       .json(httpStatusResponse(500, (error as Error).message));
   }
 };
 
-export const getBanks = async (_: AuthenticatedRequest, res: Response) => {
+export const getBanks = async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const banks = await getAvailableBanks();
+    const { storeId } = req;
+    const provider = new PaymentService(storeId);
+    const banks = await provider.getBankList();
 
     return res
       .status(200)
-      .json(httpStatusResponse(200, "Banks fetched successfully", banks.data));
+      .json(httpStatusResponse(200, "Banks fetched successfully", banks));
   } catch (error) {
+    console.log(error);
     return res
       .status(500)
       .json(httpStatusResponse(500, (error as Error).message));
@@ -3333,9 +2859,9 @@ export const addSendBoxApiKey = async (
     const { storeId, body } = req;
     const { accessKey } = body;
 
-    const sendBox = new SendBox(storeId, accessKey, true);
+    const sendBox = new SendBox(storeId, true);
 
-    await sendBox.saveSendBoxAccessKey();
+    await sendBox.saveSendBoxAccessKey(accessKey);
 
     return res
       .status(200)
@@ -3353,7 +2879,7 @@ export const deleteSendBoxApiKey = async (
   try {
     const { storeId } = req;
 
-    const sendBox = new SendBox(storeId, undefined, true);
+    const sendBox = new SendBox(storeId, true);
 
     await sendBox.deleteApiKeys();
 
@@ -3365,57 +2891,176 @@ export const deleteSendBoxApiKey = async (
   }
 };
 
-export const payWithBankAccount = async (req: Request, res: Response) => {
-  const { id, paymentFor = "order" } = req.body;
-  let order: IOrder;
-  const data = {
-    amount: 0,
-    details: { firstName: "", lastName: "", email: "", phoneNumber: "" },
-  };
-
-  if (paymentFor === "order") {
-    try {
-      order = await OrderModel.findById(id);
-      const { storeName } = await isStoreActive(order.storeId);
-
-      const { email, phoneNumber } = order.customerDetails;
-
-      data["amount"] = order.amountLeftToPay;
-      data["details"] = {
-        ...data["details"],
-        firstName: storeName,
-        email,
-        phoneNumber,
-      };
-    } catch (error) {
-      console.log(error);
-      return res.status(500).json(httpStatusResponse(500, error.message));
-    }
-  }
-
-  const payment = new PaymentService(data["amount"]);
+export const getProductDraft = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
   try {
-    const { email } = data["details"];
+    const _p = new Product(req.storeId, req.userId);
 
-    await payment.startSession();
-
-    await payment.generateRef();
-
-    await payment.createVirtualAccount({
-      email,
-    });
-
-    await payment.createTransaction(id, paymentFor);
-
-    await payment.commitSession();
+    const products = await _p.getProductsDraft();
 
     return res
       .status(200)
-      .json(httpStatusResponse(200, undefined, payment.virtualAccount));
+      .json(httpStatusResponse(200, "Drafts fetch successfully", products));
   } catch (error) {
-    console.error(error);
-    if (payment.session) {
-      await payment.cancelSession();
+    return res
+      .status(500)
+      .json(httpStatusResponse(500, (error as Error).message));
+  }
+};
+
+export const getDedicatedAcocunt = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { storeId } = req;
+
+    const account = await DedicatedAccountModel.findOne({ storeId });
+
+    return res
+      .status(200)
+      .json(
+        httpStatusResponse(
+          200,
+          "Account fetched successfully",
+          account?.toObject()
+        )
+      );
+  } catch (error) {
+    console.log(error);
+    return res.status(500).json(httpStatusResponse(500, error.message));
+  }
+};
+
+export const createDedicatedAccount = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { storeId } = req;
+
+    const account = new Account(storeId, req.userId);
+
+    await account.generateAccountForStore();
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "Account created successfully"));
+  } catch (error) {
+    console.log(error);
+    return res.status(500).json(httpStatusResponse(500, error.message));
+  }
+};
+
+export const makePayment = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const {
+      id,
+      paymentFor = "order",
+      paymentOption = "card",
+      storeCode = "",
+      meta = { months: 1 },
+    } = req.body;
+
+    let storeIdentifier = storeCode;
+    let identifier = id;
+
+    console.log({ storeIdentifier });
+
+    //if the user is authenticated and the payment is not for an order, we use the storeId
+    if (req.userId && paymentFor !== "order") {
+      storeIdentifier = req.storeId;
+      identifier = req.userId;
     }
+
+    const payment = new PaymentService(storeIdentifier);
+
+    const data = await payment.makePayment(
+      identifier,
+      paymentFor,
+      paymentOption,
+      meta
+    );
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "Charge Initiated Successfully", data));
+  } catch (error) {
+    console.log(error);
+    return res
+      .status(500)
+      .json(httpStatusResponse(500, (error as Error).message));
+  }
+};
+
+export const validateFlutterwavePayment = async (
+  req: Request,
+  res: Response
+) => {
+  try {
+    const { tx_ref, status, storeId } = req.query as unknown as {
+      tx_ref: string;
+      status: "session_expired" | "successful";
+      storeId?: string;
+    };
+
+    const allowStatus = new Set(["completed", "successfull"]);
+
+    if (status === "session_expired") {
+      return res
+        .status(409)
+        .json(
+          httpStatusResponse(
+            409,
+            "PAYMENT_VALIDATION_FAILED: our payment provider notify us that this transaction session has expired, Please restart the session"
+          )
+        );
+    }
+
+    if (!allowStatus.has(status)) {
+      return res
+        .status(429)
+        .json(
+          httpStatusResponse(
+            429,
+            `PAYMENT_VALIDATION_FAILED: our payment provider notify us that this transaction session has expired, Please restart the session, STATUS:${status}`
+          )
+        );
+    }
+
+    console.log({ storeId, tx_ref });
+    const payment = new PaymentService(storeId);
+
+    await payment.validateFlutterwavePayment(tx_ref);
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "PAYMENT_VALIDATED_SUCCESSFULLY"));
+  } catch (error) {
+    console.log(error);
+    return res
+      .status(500)
+      .json(httpStatusResponse(500, (error as Error).message));
+  }
+};
+
+export const subscribeForStoreBuildAI = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const payment = new PaymentService(req.storeId);
+
+    await payment.subscribeForAI();
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "SUBSCRIBED_SUCCESSFULLY"));
+  } catch (error) {
+    return res
+      .status(500)
+      .json(httpStatusResponse(500, (error as Error).message));
   }
 };

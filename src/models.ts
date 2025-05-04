@@ -1,8 +1,9 @@
-import mongoose, { Document } from "mongoose";
+import mongoose, { Document, mongo } from "mongoose";
 import {
   ICategory,
   IChatBotConversation,
   ICustomerAddress,
+  IDedicatedAccount,
   IIntegrationSubscription,
   INewsLetter,
   Integration,
@@ -28,7 +29,6 @@ import {
   PATHS,
 } from "./types";
 import {
-  areAllProductDigital,
   findStore,
   findUser,
   generateRandomString,
@@ -40,15 +40,14 @@ import { config, themes } from "./constant";
 import axios from "axios";
 import {
   balanceUpdatedEmail,
-  EmailType,
   generateAdminOrderNotificationEmail,
-  generateEmail,
   generateManualPaymentEmail,
   generateOrderCompletionEmail,
   generateOrderEmailWithPaymentLink,
   generateWelcomeEmail,
   subscriptionSuccessful,
 } from "./emails";
+import { Account, Store } from "./server-utils";
 
 interface ICoupon extends Document {
   storeId: string;
@@ -203,13 +202,37 @@ const ReferralSchema: mongoose.Schema<IReferral> = new mongoose.Schema({
   date: { type: Date, default: Date.now },
 });
 
-const TransactionSchema: mongoose.Schema<ITransaction> = new mongoose.Schema({
-  amount: { type: Number, required: true },
-  paymentFor: { type: String, required: true },
-  paymentMethod: { type: String, required: true },
-  paymentStatus: { type: String, required: true },
-  txRef: { type: String, required: true },
-});
+const TransactionSchema: mongoose.Schema<ITransaction> = new mongoose.Schema(
+  {
+    amount: { type: Number, required: true },
+    paymentFor: {
+      type: String,
+      enum: ["order", "subscription", "store-build-ai"],
+      required: true,
+    },
+    paymentMethod: { type: String, required: true },
+    paymentStatus: {
+      type: String,
+      required: true,
+      enum: ["successful", "paid", "failed", "pending"],
+    },
+    txRef: { type: String, required: true },
+    identifier: { type: String, required: true },
+    paymentChannel: {
+      type: String,
+      enum: ["balance", "billStack", "flutterwave"],
+      required: true,
+    },
+    type: {
+      type: String,
+      enum: ["Funding", "Withdrawal", "Refund", "Transfer", "Payment"],
+      required: true,
+    },
+    meta: { type: mongoose.Schema.Types.Mixed },
+    storeId: { type: String, required: true },
+  },
+  { timestamps: true }
+);
 
 export const CategorySchema = new mongoose.Schema<ICategory>(
   {
@@ -275,7 +298,6 @@ export const StoreSchema: mongoose.Schema<IStore> = new mongoose.Schema(
       type: String,
       required: true,
       unique: true,
-      default: generateRandomString(6),
     },
     productType: {
       type: String,
@@ -432,7 +454,7 @@ export const StoreSchema: mongoose.Schema<IStore> = new mongoose.Schema(
         canSearch: { type: Boolean, default: true },
         sort: {
           type: [String],
-          enum: ["date", "name", "price", "discount"],
+          //enum: ["date", "name", "price", "discount"],
         },
         havePagination: { type: Boolean, default: true },
       },
@@ -553,7 +575,7 @@ const PaymentDetailsSchema = new mongoose.Schema<IOrderPaymentDetails>({
   transactionId: { type: String, required: true },
   paymentDate: { type: String, required: true },
   tx_ref: { type: String, required: true },
-  paymentLink: { type: String, required: true },
+  paymentLink: { type: String },
 });
 
 // Address Subdocument
@@ -932,12 +954,6 @@ OrderSchema.pre("save", async function (next) {
       );
     }
 
-    if (this.deliveryType !== "sendbox") {
-      this.customerDetails.shippingAddress = undefined;
-      this.shippingDetails.shippingCost = 0;
-      this.shippingDetails.trackingNumber = undefined;
-    }
-
     next();
   } catch (error) {
     next(error);
@@ -1023,24 +1039,9 @@ StoreSchema.pre("save", async function (next) {
   if (this.isActive && !this.isNew) {
     const user = await UserModel.findById(this.owner);
 
-    const storeHasProduct = await ProductModel.exists({
-      isActive: true,
-      storeId: this._id,
-    });
+    const account = new Store(this._id, user._id);
 
-    if (!storeHasProduct) {
-      next(
-        new Error("Please add at least one product to make your store active.")
-      );
-    }
-
-    if (!user.isEmailVerified) {
-      next(new Error("Please verify your email to make your store active"));
-    }
-
-    if (!user.phoneNumber) {
-      next(new Error("Please add a phoneNumber to make your store active"));
-    }
+    await account.canStoreGoPublic();
   }
 
   // This will run only when the showImage is show on the store store and will check if all the categories have images to be shown or not
@@ -1064,31 +1065,19 @@ StoreSchema.pre("findOneAndUpdate", async function (next) {
   const query = this.getQuery();
   const update = this.getUpdate() as mongoose.UpdateQuery<IStore>;
 
-  const store = await findStore(query._id);
+  console.log({ queryID: query._id });
+  const store = await StoreModel.findById(query._id);
+
+  if (!store) {
+    throw new Error("STORE_QUERY_FAILED: unable to locate store.");
+  }
 
   // Making sure certain creterias are satisfy before toggling this
-  //  if (update.isActive) {
-  //    const user = await UserModel.findById(store.owner);
-  //
-  //    const storeHasProduct = await ProductModel.exists({
-  //      isActive: true,
-  //      storeId: store._id,
-  //    });
-  //
-  //    if (!storeHasProduct) {
-  //      next(
-  //        new Error("Please add at least one product to make your store active.")
-  //      );
-  //    }
-  //
-  //    if (!user.isEmailVerified) {
-  //      next(new Error("Please verify your email to make your store active"));
-  //    }
-  //
-  //    if (!user.phoneNumber) {
-  //      next(new Error("Please add a phoneNumber to make your store active"));
-  //    }
-  //  }
+  if (update.isActive) {
+    const account = new Store(query._id, store.owner);
+
+    await account.canStoreGoPublic();
+  }
 
   next();
 });
@@ -1201,6 +1190,17 @@ const IntegrationPropsSchema = new mongoose.Schema<IntegrationProps>({
     default: {},
     select: false,
   },
+  subcription: {
+    start_date: {
+      type: String,
+    },
+    end_date: {
+      type: String,
+    },
+    comment: {
+      type: String,
+    },
+  },
 });
 
 const IntegrationSchema = new mongoose.Schema<Integration>({
@@ -1212,27 +1212,25 @@ IntegrationSchema.pre("save", async function (next) {
   try {
     if (!this.integration.isConnected) return;
 
+    const now = new Date();
+
     const isConnected = this.integration.isConnected;
 
-    const premiumIntegrations = ["chatbot"];
+    const premiumIntegrations = new Set(["chatbot"]);
 
     const integrationId = this.integration.name;
 
-    const subscription = await validateIntegrationSubscription(
-      this.storeId,
-      integrationId
-    );
+    // Check if the integration is premium and user has subscribed to it.
+    const activeSubscriptions =
+      new Date(this?.integration?.subcription?.end_date) > now;
 
-    if (premiumIntegrations.includes(integrationId)) {
-      if (!isConnected && !subscription) {
+    if (premiumIntegrations.has(integrationId)) {
+      if (!isConnected && !activeSubscriptions) {
         next(
           new Error(
-            "Please subscription to this integration before you can connect it to your store."
+            "CANNOT_CONNECT_INTEGRATION: Please subscription to this integration before you can connect it to your store."
           )
         );
-      } else if (isConnected && subscription) {
-        subscription.isActive = false;
-        await subscription.save({ validateBeforeSave: true });
       }
 
       next();
@@ -1430,40 +1428,25 @@ const StoreBankAccountSchema: mongoose.Schema<IStoreBankAccounts> =
     { timestamps: true }
   );
 
-StoreBankAccountSchema.pre("save", async function (next) {
-  try {
-    const payload = {
-      bank_code: this.bankCode,
-      country_code: "NG",
-      account_number: this.accountNumber,
-      account_name: this.accountName,
-      account_type: "personal",
-      document_type: "identityNumber",
-      document_number: this.nin,
-    };
-
-    const res = await axios.post<{
-      status: boolean;
-      message: string;
-      data: {
-        verified: boolean;
-        verificationMessage: string;
-      };
-    }>(`https://api.paystack.co/bank/validate`, payload, {
-      headers: {
-        Authorization: `Bearer ${config.PAYSTACK_SECRET}`,
+const DedicatedAccountSchema: mongoose.Schema<IDedicatedAccount> =
+  new mongoose.Schema({
+    accountDetails: {
+      accountName: {
+        type: String,
+        required: true,
       },
-    });
-
-    if (!res.data.data.verified) {
-      throw new Error(res.data.data.verificationMessage);
-    }
-
-    next();
-  } catch (error) {
-    next(error);
-  }
-});
+      accountNumber: {
+        type: String,
+        unique: true,
+      },
+      bankName: {
+        type: String,
+      },
+    },
+    accountRef: { type: String, unique: true, required: true },
+    ref: { type: String, unique: true, required: true },
+    storeId: { type: String, unique: true, required: true },
+  });
 
 export const ChatBotConversationModel = mongoose.model<IChatBotConversation>(
   "ChatBotConversation",
@@ -1508,4 +1491,8 @@ export const ProductTypesModel = mongoose.model(
 export const TransactionModel = mongoose.model(
   "transaction",
   TransactionSchema
+);
+export const DedicatedAccountModel = mongoose.model(
+  "dedicatedAccount",
+  DedicatedAccountSchema
 );

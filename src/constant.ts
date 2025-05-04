@@ -1,5 +1,5 @@
 import dotenv from "dotenv";
-import { createStore, generateRandomString } from "./helper";
+import { generateRandomString } from "./helper";
 import { IStore } from "./types";
 import { FunctionDeclaration, SchemaType } from "@google/generative-ai";
 import { PipelineStage } from "mongoose";
@@ -156,6 +156,8 @@ export const config = {
   GOOGLE_GEMINI_API_KEY: process.env.GOOGLE_GEMINI_API_KEY,
   TOTAL_CUSTOMER_CHAT: process.env.TOTAL_CUSTOMER_CHAT,
   CHATBOT_SUBSCRIPTION_FEE: process.env.CHATBOT_SUBSCRIPTION_FEE,
+  FLUTTERWAVE_SECRET_KEY: process.env.FLUTTERWAVE_SECRET_KEY,
+  BILL_STACK_API_KEY: process.env.BILLSTACK_API_KEY,
 };
 
 export const referralPipeLine = (userId: string): PipelineStage[] => [
@@ -221,57 +223,6 @@ export const referralPipeLine = (userId: string): PipelineStage[] => [
     },
   },
 ];
-
-export const DEFAULT_STORE_CONFIG: IStore = {
-  storeName: "New Store " + generateRandomString(5),
-  storeCode: generateRandomString(5),
-  productType: "",
-  templateId: generateRandomString(18),
-  status: "active",
-  aboutStore: "",
-  description: "",
-  balance: 0,
-  owner: "",
-  isActive: true,
-  customizations: {
-    logoUrl: "",
-    banner: {
-      type: "discount",
-      product: "",
-      description: "",
-      header: "We bring the store to your door",
-      btnAction: "goToPage",
-      buttonLabel: "Shop Now",
-      image: "",
-    },
-    category: {
-      showImage: true,
-      icon: "",
-      header: "Categories",
-      image: "",
-    },
-    productsPages: {
-      canFilter: true,
-      canSearch: true,
-      sort: ["date", "discount", "name"],
-      havePagination: true,
-    },
-    productPage: {
-      showSimilarProducts: true,
-      style: "one",
-      showReviews: true,
-    },
-    features: {
-      showFeatures: false,
-      features: [],
-      style: "one",
-    },
-    footer: {
-      style: "one",
-      showNewsLetter: true,
-    },
-  },
-};
 
 export function getFunctionDeclarations(): FunctionDeclaration[] {
   return [
@@ -872,7 +823,3 @@ export function getCustomerFunctionDeclarations(): FunctionDeclaration[] {
     },
   ];
 }
-
-export const aiFunctions: Record<string, any> = {
-  createStore: createStore,
-};

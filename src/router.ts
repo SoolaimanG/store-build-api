@@ -1,12 +1,11 @@
 import express from "express";
-import { body, check } from "express-validator";
+import { body } from "express-validator";
 import { validateRequest } from "./helper";
 import {
   _calculateDeliveryCost,
-  _getBanks,
-  _sendOTP,
+  sendOTP,
   _sendQuickEmail,
-  _subscribeToChatBot,
+  addBankAccount,
   addOrEditStoreAddress,
   addSendBoxApiKey,
   aiStoreAssistant,
@@ -15,6 +14,7 @@ import {
   connectAndDisconnectIntegration,
   createCategory,
   createCoupon,
+  createDedicatedAccount,
   createDeliveryPickupForOrder,
   createOrder,
   createOrEditProduct,
@@ -40,6 +40,7 @@ import {
   getCustomers,
   getCustomerStats,
   getDashboardContent,
+  getDedicatedAcocunt,
   getIntegration,
   getIntegrations,
   getInvoice,
@@ -49,6 +50,7 @@ import {
   getOrders,
   getProduct,
   getProductAnalytics,
+  getProductDraft,
   getProductReview,
   getProducts,
   getProductTypes,
@@ -63,21 +65,21 @@ import {
   getTutorial,
   getUser,
   hasFinishedTutorialVideo,
-  initiateChargeForSubscription,
   joinNewsLetter,
+  makePayment,
   manageIntegration,
   markTutorialAsCompleted,
-  payWithBankAccount,
   requestCancelOrder,
   requestConfirmationOnOrder,
   signUp,
   updateUser,
+  validateFlutterwavePayment,
   verifyAccountNumber,
-  verifySubscription,
   verifyToken,
   watchTutorial,
   welcomeHome,
   writeReviewOnProdcut,
+  subscribeForStoreBuildAI,
 } from "./controllers";
 import {
   checkIfUserIsAuthenticated,
@@ -95,6 +97,7 @@ router.post(
 );
 
 router.get("/product-types/", getProductTypes);
+
 router.post(
   "/sign-up/",
   [
@@ -109,7 +112,7 @@ router.post(
 
 router.get("/does-email-or-store-exist/", doesEmailOrStoreExist);
 
-router.post("/send-otp/", [body("tokenFor").isEmpty()], _sendOTP);
+router.post("/send-otp/", [body("tokenFor").isEmpty()], sendOTP);
 
 router.post(
   "/verify-token/",
@@ -120,15 +123,13 @@ router.post(
 
 router.get("/user/", checkIfUserIsAuthenticated, getUser);
 
-router.get(
-  "/verify-subscription/",
-  checkIfUserIsAuthenticated,
-  verifySubscription
-);
-
 router.get("/get-categories/:storeId/", getCategories);
 
-router.get("/verify-account-number/", verifyAccountNumber);
+router.get(
+  "/verify-account-number/",
+  checkIfUserIsAuthenticated,
+  verifyAccountNumber
+);
 
 router.get(
   "/get-dashboard-content/",
@@ -279,12 +280,6 @@ router.get(
   getSalesChartData
 );
 
-router.post(
-  "/initialize-charge-for-subscription/",
-  checkIfUserIsAuthenticated,
-  initiateChargeForSubscription
-);
-
 router.get(
   "/get-customers-stats/",
   checkIfUserIsAuthenticated,
@@ -337,12 +332,6 @@ router.post(
 
 router.patch("/edit-order-for-customer/:orderId/", editOrderForCustomer);
 
-router.post(
-  "/subscribe-to-chat-bot/",
-  checkIfUserIsAuthenticated,
-  _subscribeToChatBot
-);
-
 router.get(
   `/get-onboarding-flow/`,
   checkIfUserIsAuthenticated,
@@ -367,7 +356,35 @@ router.delete(
   deleteSendBoxApiKey
 );
 
-router.post(`/pay-with-bank-account/`, payWithBankAccount);
+router.post("/add-bank-account/", checkIfUserIsAuthenticated, addBankAccount);
+
+router.get(
+  "/get-products-drafts/",
+  checkIfUserIsAuthenticated,
+  getProductDraft
+);
+
+router.get(
+  "/get-dedicated-account/",
+  checkIfUserIsAuthenticated,
+  getDedicatedAcocunt
+);
+
+router.post(
+  "/create-dedicated-account/",
+  checkIfUserIsAuthenticated,
+  createDedicatedAccount
+);
+
+router.post("/create-charge/", passUserIfAuthenticated, makePayment);
+
+router.get(`/validate-flutter-wave-payment/`, validateFlutterwavePayment);
+
+router.post(
+  "/subcribe-to-chat-bot/",
+  checkIfUserIsAuthenticated,
+  subscribeForStoreBuildAI
+);
 
 router.get("/", welcomeHome);
 

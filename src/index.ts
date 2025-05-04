@@ -24,17 +24,17 @@ storeBuild.use(errorMiddleWare);
 // Routing
 storeBuild.use("/api/v1", router());
 
-// connectDB()
-//   .then(() => {
-//     console.log("BD connected");
-//   })
-//   .catch(() => {
-//     console.log("DB failed to connect");
-//   });
+//connectDB()
+//  .then(() => {
+//    console.log("BD connected");
+//  })
+//  .catch(() => {
+//    console.log("DB failed to connect");
+//  });
 
 storeBuild.listen(port, async () => {
   await connectDB();
   console.log(`Starting server on ${process.env.DOMAIN}`);
 });
 
-// module.exports = storeBuild;
+//module.exports = storeBuild;

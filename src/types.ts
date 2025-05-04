@@ -1,6 +1,5 @@
 import { FunctionDeclaration } from "@google/generative-ai";
-import { themes } from "constant";
-import mongoose, { Document } from "mongoose";
+import { Document } from "mongoose";
 
 export type IJoinNewsLetterFrom = "modal" | "input";
 
@@ -43,7 +42,7 @@ export type IPlan = {
 
 // Main User Data Structure
 export type IUser = {
-  _id: string;
+  _id?: string;
   fullName: string;
   email: string;
   phoneNumber?: string;
@@ -370,7 +369,7 @@ export type IShippingDetails = {
   shippingCost: number;
   estimatedDeliveryDate: string;
   trackingNumber?: string;
-  carrier: "SENDBOX";
+  carrier: "SENDBOX" | string;
 };
 
 export interface BreakdownItem {
@@ -612,6 +611,11 @@ export type IntegrationProps = {
   apiKeys?: {
     accessKey?: string;
     token?: string;
+  };
+  subcription?: {
+    comment?: string;
+    start_date: string;
+    end_date: string;
   };
 };
 
@@ -959,6 +963,14 @@ export type PickUpCreationResponse = {
   total_value: number;
 };
 
+export type ITransactionType =
+  | "Funding"
+  | "Withdrawal"
+  | "Refund"
+  | "Transfer"
+  | "Payment";
+export type IPaymentChannel = "balance" | "billStack" | "flutterwave";
+
 export interface ITransaction<T = any> extends ITimeStamp {
   txRef: string;
   paymentMethod: string;
@@ -966,8 +978,11 @@ export interface ITransaction<T = any> extends ITimeStamp {
   paymentStatus: IPaymentStatus;
   paymentFor: IPaymentFor;
   _id?: string;
-  userId: string;
+  identifier: string;
   meta?: T;
+  type: ITransactionType;
+  storeId: string;
+  paymentChannel: IPaymentChannel;
 }
 
 export type IIntegrationSubscription = {
@@ -1276,6 +1291,80 @@ export interface BillStackWebHook {
       first_name: string;
       last_name: string;
       createdAt: string;
+    };
+  };
+}
+
+export interface IBank {
+  id: number;
+  name: string;
+  slug: string;
+  code: string;
+  longcode: string;
+  gateway: "emandate";
+  pay_with_bank: boolean;
+  supports_transfer: boolean;
+  active: boolean;
+  country: "Nigeria";
+  currency: "NGN";
+  type: string;
+  is_deleted: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface getProductFilters {
+  q?: string;
+  sort?: "default" | "stock-level" | "low-to-high" | "high-to-low";
+  category?: string;
+  minPrice?: string;
+  maxPrice?: string;
+  size?: number;
+  storeId: string;
+  productsToShow?: string;
+  colors?: string[];
+  sizes?: string[];
+  gender?: IGender[];
+  rating?: number;
+  isActive?: boolean;
+}
+
+export interface IDedicatedAccount {
+  accountRef: string;
+  accountDetails: {
+    accountNumber: string;
+    accountName: string;
+    bankName: string;
+  };
+  ref: string;
+  storeId: string;
+}
+
+export type IBillStackReservedBankTypes =
+  | "9PSB"
+  | "PALMPAY"
+  | "BANKLY"
+  | "PROVIDUS"
+  | "SAFEHAVEN";
+
+export interface IBillStackDedicatedAccountResponse {
+  status: boolean;
+  message: string;
+  data: {
+    reference: string;
+    account: [
+      {
+        account_number: string;
+        account_name: string;
+        bank_name: string;
+        bank_id: IBillStackReservedBankTypes;
+        created_at: string;
+      }
+    ];
+    meta: {
+      firstName: string;
+      lastName: string;
+      email: string;
     };
   };
 }
