@@ -6,8 +6,6 @@ import {
   _editStore,
   _verifyTransaction,
   addToNewsLetter,
-  allowOrderStatus,
-  calculateDeliveryCost,
   calculateMetrics,
   calculatePercentageChange,
   calculateProductReviewStats,
@@ -24,6 +22,7 @@ import {
   handleIntegrationConnection,
   handleReferralLogic,
   httpStatusResponse,
+  maskAccountNumber,
   sendEmail,
   sendQuickEmail,
   StoreBuildAI,
@@ -457,11 +456,14 @@ export const getProducts = async (req: AuthenticatedRequest, res: Response) => {
     const { storeId: sId, query, userId } = req;
     const { storeId: _sId, ...filters } = query as unknown as getProductFilters;
 
-    const storeId = sId || _sId;
+    const storeId = _sId || sId;
 
     const products = new Product(storeId, userId);
 
-    const resp = await products.getProducts({ ...filters, storeId });
+    const resp = await products.getProducts(
+      { ...filters, storeId },
+      Boolean(sId)
+    );
 
     const response = httpStatusResponse(200, undefined, resp);
 
@@ -640,20 +642,23 @@ export const calculateProductPrice = async (req: Request, res: Response) => {
   }
 };
 
-//TODO: rewrite this code.
 export const _calculateDeliveryCost = async (req: Request, res: Response) => {
   try {
-    const { products, address, email, name, phoneNumber, couponCode } =
-      req.body as {
-        products: IOrderProduct[];
-        address: ICustomerAddress;
-        email: string;
-        name: string;
-        phoneNumber: string;
-        couponCode: string;
-      };
-
-    const { storeId } = req.params;
+    const {
+      products: orderProducts,
+      address,
+      email,
+      name,
+      phoneNumber,
+      couponCode,
+    } = req.body as {
+      products: IOrderProduct[];
+      address: ICustomerAddress;
+      email: string;
+      name: string;
+      phoneNumber: string;
+      couponCode: string;
+    };
 
     const customerDetails: ICustomer & { shippingDetails: ICustomerAddress } = {
       email,
@@ -664,22 +669,33 @@ export const _calculateDeliveryCost = async (req: Request, res: Response) => {
       },
     };
 
-    const cartItems = products.map((cart) => ({
+    //Restructing the products for the totalAmount calculations
+    const products = orderProducts.map((cart) => ({
       productId: cart._id,
       color: cart.color,
       size: cart.size,
     }));
 
-    const { totalAmount } = await calculateTotalAmount(cartItems, couponCode);
+    const { storeId } = req.params;
 
-    const result = await calculateDeliveryCost(
-      customerDetails,
-      totalAmount,
-      storeId,
-      products
+    const order = new Order(storeId);
+
+    const { totalAmount } = await order.calculateOrderAmount(
+      products,
+      couponCode
     );
 
-    return res.status(200).json(httpStatusResponse(200, undefined, result));
+    const sendBox = new SendBox(storeId);
+
+    const shipmentResponse = await sendBox.calculateShippingCost(
+      customerDetails,
+      totalAmount,
+      orderProducts
+    );
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, undefined, shipmentResponse));
   } catch (error) {
     const err = error as Error;
     return res.status(500).json(httpStatusResponse(500, err.message));
@@ -1106,31 +1122,18 @@ export const getQuickEmails = async (
   }
 };
 
-export const editOrderForCustomer = async (req: Request, res: Response) => {
-  try {
-    const { phoneNumber, updates } = req.body;
-    const { orderId } = req.params;
-
-    const orderService = new Order();
-
-    await orderService.editOrder(orderId, phoneNumber, updates, false);
-
-    return res.status(200).json(httpStatusResponse(200, "Order updated"));
-  } catch (error) {
-    return res.status(500).json(httpStatusResponse(500, error.message));
-  }
-};
-
 export const _sendQuickEmail = async (
   req: AuthenticatedRequest,
   res: Response
 ) => {
   try {
-    const { orderId } = req.body;
+    const { orderId, phoneNumber } = req.body;
 
     const { emailId } = req.params;
 
-    const order = await OrderModel.findById(orderId);
+    const orderService = new Order(req.storeId);
+
+    const order = await orderService.getOrder(orderId, phoneNumber);
 
     if (!order) {
       return res
@@ -1140,14 +1143,6 @@ export const _sendQuickEmail = async (
             404,
             "Order with this ID does not exist on our database."
           )
-        );
-    }
-
-    if (order.orderStatus === "Completed") {
-      return res
-        .status(400)
-        .json(
-          httpStatusResponse(400, "This order has already been completed.")
         );
     }
 
@@ -1164,32 +1159,29 @@ export const _sendQuickEmail = async (
 
 export const editOrder = async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { updates, partial = false } = req.body;
-
+    const { updates, phoneNumber } = req.body;
     const { orderId } = req.params;
 
-    const order = await OrderModel.findById(orderId);
+    const orderService = new Order(req.storeId);
 
-    if (order.orderStatus === "Completed") {
-      return res
-        .status(400)
-        .json(
-          httpStatusResponse(400, "This order has already been completed.")
-        );
-    }
-
-    const newOrder = await _editOrder(orderId, updates, partial);
+    const newOrder = await orderService.editOrder(
+      orderId,
+      phoneNumber,
+      updates,
+      Boolean(req.userId && req.storeId)
+    );
 
     return res
       .status(200)
       .json(
         httpStatusResponse(
           200,
-          "Order has been updated successfully",
-          newOrder.toObject()
+          "ORDER_EDITTED_SUCCESSFULLY: This order has now been editted",
+          newOrder
         )
       );
   } catch (error) {
+    console.log(error);
     const err = error as Error;
     return res.status(500).json(httpStatusResponse(500, err.message));
   }
@@ -1631,12 +1623,12 @@ export const getCustomer = async (req: AuthenticatedRequest, res: Response) => {
 
 export const editStore = async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { storeId, body } = req;
+    const { storeId, body, userId } = req;
     const { updates, partial = true } = body;
 
-    // isStoreActive(storeId);
+    const store = new Store(storeId, userId);
 
-    const store = await _editStore(storeId, updates, partial);
+    const edittedStore = await store.editStore(updates, partial);
 
     return res
       .status(200)
@@ -1644,7 +1636,7 @@ export const editStore = async (req: AuthenticatedRequest, res: Response) => {
         httpStatusResponse(
           200,
           "Changes has been applied to your store.",
-          store
+          edittedStore
         )
       );
   } catch (error) {
@@ -1658,14 +1650,16 @@ export const getStore = async (req: AuthenticatedRequest, res: Response) => {
     const { storeId, query, userId } = req;
     const { storeCode } = query as unknown as { storeCode: string };
 
-    let store: IStore;
+    let storeResp: IStore;
 
-    const account = new Store(storeId, userId);
+    const store = new Store(storeId, userId);
 
     if (storeCode) {
-      const resp = await account.previewStore(storeCode);
+      const resp = await store.previewStore(storeCode);
 
-      store = resp.store;
+      storeResp = resp.store;
+
+      console.log({ storeResp });
 
       if (resp.action === "expired") {
         return res
@@ -1685,11 +1679,18 @@ export const getStore = async (req: AuthenticatedRequest, res: Response) => {
       }
     }
 
+    //If the store code is not given but the storeId is provided we fetch using the storeId
     if (!storeCode && storeId) {
-      store = await findStore(storeId);
+      //await store.isStoreActive(true);
+
+      storeResp = await StoreModel.findById(storeId).select("+balance");
+
+      if (!storeResp) {
+        return res.status(404).json(httpStatusResponse(404, "Store not found"));
+      }
     }
 
-    return res.status(200).json(httpStatusResponse(200, undefined, store));
+    return res.status(200).json(httpStatusResponse(200, undefined, storeResp));
   } catch (error) {
     const err = error as Error;
     console.log(err);
@@ -1728,16 +1729,17 @@ export const writeReviewOnProdcut = async (req: Request, res: Response) => {
   try {
     const review = req.body as IRating;
 
-    const newReview = new RatingModel(review);
+    const account = new Account(review.storeId);
 
-    await newReview.save();
+    const newReview = await account.writeReviewOnProduct(review);
 
     return res
       .status(200)
       .json(
         httpStatusResponse(
           200,
-          "Your review has been sent, thanks for the feedback"
+          "Your review has been sent, thanks for the feedback",
+          newReview
         )
       );
   } catch (error) {
@@ -2065,32 +2067,19 @@ export const editDeliveryAddress = async (req: Request, res: Response) => {
 export const requestCancelOrder = async (req: Request, res: Response) => {
   try {
     const { orderId } = req.params;
-    const { storeId } = req.query as undefined as { storeId?: string };
+    const {
+      storeId,
+      phoneNumber,
+      reason = "",
+    } = req.query as undefined as {
+      storeId?: string;
+      phoneNumber?: string;
+      reason?: string;
+    };
 
-    const order = (await findOrder(orderId, storeId)).toObject();
+    const orderService = new Order(storeId);
 
-    allowOrderStatus(order.orderStatus);
-
-    const store = await findStore(storeId, true, {
-      owner: 1,
-      customizations: 1,
-    });
-
-    const user = await findUser(store.owner, true, { email: 1 });
-
-    const email = generateEmail(
-      EmailType.ORDER_CANCELLATION_REQUEST,
-      { email: order.customerDetails.email, name: order.customerDetails.name },
-      {
-        primary: store.customizations.theme.primary,
-        secondary: store.customizations.theme.secondary,
-      },
-      order,
-      undefined,
-      store.storeName
-    );
-
-    await sendEmail(user.email, email.body, user.email, email.subject);
+    await orderService.requestCancellation(orderId, phoneNumber, reason);
 
     return res
       .status(200)
@@ -2118,8 +2107,6 @@ export const requestConfirmationOnOrder = async (
       findOrder(orderId, storeId),
       findStore(storeId),
     ]);
-
-    allowOrderStatus(order.orderStatus);
 
     const user = await findUser(store.owner);
     const email = generateEmail(
@@ -2788,20 +2775,31 @@ export const getStoreBank = async (
   res: Response
 ) => {
   try {
-    const { storeCode } = req.query;
+    const {
+      storeCode,
+      size = 5,
+      getDefault = false,
+    } = req.query as unknown as {
+      storeCode: string;
+      size: number;
+      getDefault: boolean;
+    };
 
-    const store = await findStore({ storeCode });
+    const account = new Account(req.storeId, req.userId);
 
-    const bank = await StoreBankAccountModel.findOne({ storeId: store._id });
+    const banks = (
+      await account.getStoreAccounts(size, storeCode, getDefault)
+    )?.map((bank) => {
+      return {
+        ...bank,
+        accountNumber: maskAccountNumber(bank.accountNumber),
+      };
+    });
 
     return res
       .status(200)
       .json(
-        httpStatusResponse(
-          200,
-          "BankAccount fetched successfully",
-          bank.toObject()
-        )
+        httpStatusResponse(200, "Bank accounts fetched successfully", banks)
       );
   } catch (error) {
     return res
@@ -3058,6 +3056,76 @@ export const subscribeForStoreBuildAI = async (
     return res
       .status(200)
       .json(httpStatusResponse(200, "SUBSCRIBED_SUCCESSFULLY"));
+  } catch (error) {
+    return res
+      .status(500)
+      .json(httpStatusResponse(500, (error as Error).message));
+  }
+};
+
+export const withdraw = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { amount, accountId, otp } = req.body;
+
+    const payment = new PaymentService(req.storeId);
+
+    await payment.requestWithdraw(amount, accountId, otp);
+
+    return res
+      .status(200)
+      .json(httpStatusResponse(200, "WITHDRAW_REQUESTED_SUCCESSFULLY"));
+  } catch (error) {
+    console.log(error);
+    return res
+      .status(500)
+      .json(httpStatusResponse(500, (error as Error).message));
+  }
+};
+
+export const getInternalTransaction = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const { size = 5, skip = 0 } = req.query as unknown as {
+      size?: number;
+      skip?: number;
+    };
+
+    const payment = new PaymentService(req.storeId);
+
+    const transactions = await payment.getInternalTransactions({ size, skip });
+
+    return res
+      .status(200)
+      .json(
+        httpStatusResponse(
+          200,
+          "Transactions fetched successfully",
+          transactions
+        )
+      );
+  } catch (error) {
+    return res
+      .status(500)
+      .json(httpStatusResponse(500, (error as Error).message));
+  }
+};
+
+export const getAiSuggestions = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const ai = new StoreBuildAI(req.storeId, req.userId, "", true);
+
+    const suggestions = await ai.aiSuggestions();
+
+    return res
+      .status(200)
+      .json(
+        httpStatusResponse(200, "Suggestions fetched successfully", suggestions)
+      );
   } catch (error) {
     return res
       .status(500)

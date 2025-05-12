@@ -25,7 +25,7 @@ export type IStoreTemplates =
   | "beauty"
   | "decoration";
 
-export type IOTPFor = "login" | "verify-email";
+export type IOTPFor = "login" | "verify-email" | "withdraw";
 
 export type ITimeStamp = {
   createdAt?: string;
@@ -181,6 +181,8 @@ export type IStore = {
     };
   };
   sections?: ISection[];
+  lockedBalance?: number;
+  pendingBalance?: number;
 } & ITimeStamp;
 
 export type IStoreSettings = {
@@ -1367,4 +1369,34 @@ export interface IBillStackDedicatedAccountResponse {
       email: string;
     };
   };
+}
+
+export interface IWithdrawalQueue extends ITimeStamp {
+  _id?: string; // Unique identifier for the withdrawal request
+  userId: string; // ID of user requesting withdrawal
+  storeId: string; // ID of store the withdrawal is from
+  amount: number; // Amount to withdraw
+  status: IPaymentStatus; // Current status
+  validationPassed: boolean; // Whether validation checks passed
+  validationErrors?: string[]; // Any validation error messages
+  bankDetails: {
+    accountNumber: string; // Bank account number
+    accountName: string; // Bank account name
+    bankName: string; // Name of the bank
+    bankCode: string; // Bank code/routing number
+  };
+  transactionReference?: string; // Reference ID for the transaction
+  processingDate?: Date; // When withdrawal started processing
+  completedDate?: Date; // When withdrawal completed
+  notes?: string; // Any additional notes/comments
+  failureReason?: string; // Reason if withdrawal failed
+  ipAddress?: string; // IP address of requester
+  userAgent?: string; // User agent of requester
+}
+
+export interface IAiSuggestion extends ITimeStamp {
+  title: string;
+  description: string;
+  action: string;
+  storeId: string;
 }

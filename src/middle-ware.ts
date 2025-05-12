@@ -23,7 +23,16 @@ export const checkIfUserIsAuthenticated = (
     const token = authHeader.split(" ")[1];
     jwt.verify(token, secret, async (err, decoded: any) => {
       if (err) {
-        return res.status(403).json({ message: "Forbidden" });
+        return res
+          .status(401)
+          .json(
+            httpStatusResponse(
+              4400,
+              "Unauthorize Request: Please Login In",
+              undefined,
+              "unauthorize"
+            )
+          );
       }
 
       await verifyStore(decoded?.storeId, decoded?.userId);

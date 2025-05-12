@@ -20,11 +20,13 @@ import {
   OrderModel,
   OTPModel,
   ProductModel,
+  RatingModel,
   StoreBankAccountModel,
   StoreModel,
   StoreSttings,
   TransactionModel,
   UserModel,
+  WithdrawalQueueModel,
 } from "./models";
 import {
   FlutterwaveVirtualAccountResponse,
@@ -52,6 +54,8 @@ import {
   IUser,
   IOTPFor,
   ICoupon,
+  IWithdrawalQueue,
+  IRating,
 } from "./types";
 import mongoose from "mongoose";
 import {
@@ -60,7 +64,6 @@ import {
   otpEmailTemplate,
 } from "./emails";
 import dotenv from "dotenv";
-import { object } from "zod";
 
 dotenv.config();
 
@@ -455,10 +458,13 @@ export class PaymentService {
   constructor(storeIdentifier: string) {
     this.storeId = storeIdentifier;
 
-    console.log({ storeIdentifier });
+    this.generateRef();
+
+    this.ref;
 
     //Creating a default transaction
     this.transaction = {
+      _id: this.ref,
       amount: 0,
       meta: {},
       paymentFor: "order",
@@ -466,18 +472,40 @@ export class PaymentService {
       paymentStatus: "pending",
       txRef: "",
       identifier: "",
-      storeId: "",
+      storeId: this.storeId,
       type: "Funding",
       paymentChannel: "flutterwave",
     };
   }
 
-  async getStore() {
-    this.store = await StoreModel.findOne({
-      $or: [{ id: this.storeId }, { storeCode: this.storeId }],
-    });
+  async getStore(payload?: { select?: string }) {
+    let store;
+    try {
+      const query: Record<string, any> = {
+        $or: [{ id: this.storeId }, { storeCode: this.storeId }],
+      };
 
-    return this;
+      // Try to convert storeId to ObjectId if it's a valid format
+      if (mongoose.Types.ObjectId.isValid(this.storeId)) {
+        query.$or.push({ _id: new mongoose.Types.ObjectId(this.storeId) });
+      }
+
+      store = await StoreModel.findOne(query).select(
+        payload?.select || undefined
+      );
+
+      if (!store) {
+        throw new Error("Store not found");
+      }
+
+      this.store = store;
+      return this;
+    } catch (error) {
+      if (error.message === "Store not found") {
+        throw error;
+      }
+      throw new Error(`Failed to fetch store: ${error.message}`);
+    }
   }
 
   public async startSession(): Promise<PaymentService> {
@@ -734,7 +762,15 @@ export class PaymentService {
 
     // Set expiration date
     const expirationDate = new Date();
-    expirationDate.setMonth(expirationDate.getMonth() + monthsSubscribed);
+    const existingDate = new Date(user.plan.expiredAt);
+
+    // If user has an active subscription, add months to existing expiry date
+    if (expirationDate < existingDate) {
+      expirationDate.setTime(existingDate.getTime());
+      expirationDate.setMonth(existingDate.getMonth() + monthsSubscribed);
+    } else {
+      expirationDate.setMonth(expirationDate.getMonth() + monthsSubscribed);
+    }
 
     // Update user plan
     user.plan = {
@@ -950,6 +986,8 @@ export class PaymentService {
 
       this.order = order;
 
+      this.transaction.identifier = order._id;
+
       data["email"] = order.customerDetails.email;
       data["name"] = order.customerDetails.name;
       data["amount"] = order.amountLeftToPay;
@@ -1128,7 +1166,7 @@ export class PaymentService {
     if (transaction.paymentFor === "order") {
       const order = await OrderModel.findOne({
         $or: [
-          { id: transaction.identifier },
+          { _id: transaction.identifier },
           { "paymentDetails.transactionId": transaction.txRef },
           { "paymentDetails.tx_ref": transaction.txRef },
         ],
@@ -1144,6 +1182,7 @@ export class PaymentService {
       //Credit the store owner
       const store = await StoreModel.findById(order.storeId, {
         owner: 1,
+        storeName: 1,
       }).session(this.session);
 
       const storeOwner = await UserModel.findById(store.owner).session(
@@ -1167,6 +1206,8 @@ export class PaymentService {
 
       order.paymentDetails.paymentDate = now.toISOString();
       order.amountLeftToPay -= flwRes.amount_settled;
+
+      order.orderStatus = "Completed";
 
       await order.save({ validateModifiedOnly: true, session: this.session });
 
@@ -1526,11 +1567,16 @@ export class PaymentService {
 
     await this.generateRef();
 
-    const store = await this.getStore();
+    const store = await this.getStore({ select: "+ balance" });
 
     if (!store) {
       await this.cancelSession();
       throw new Error("PAYMENT_ERROR: Unable to locate your store");
+    }
+
+    if (!this.store.balance) {
+      await this.cancelSession();
+      throw new Error("PAYMENT_ERROR: Unable to locate your store balance");
     }
 
     const { email, fullName } = await UserModel.findById(this.store.owner, {
@@ -1539,6 +1585,11 @@ export class PaymentService {
     }).session(this.session);
 
     const SUBSCRIPTION_FEE = Number(config.SUBCRIPTION_FEE || 2000);
+
+    if (this.store.balance < SUBSCRIPTION_FEE) {
+      await this.cancelSession();
+      throw new Error("PAYMENT_ERROR: Insufficient balance");
+    }
 
     this.transaction = {
       ...this.transaction,
@@ -1663,6 +1714,167 @@ export class PaymentService {
     );
 
     await this.commitSession();
+  }
+
+  public async requestWithdraw(
+    amount: number,
+    accountId: string,
+    otp?: string
+  ) {
+    const now = new Date();
+
+    await this.startSession();
+
+    await this.getStore();
+
+    if (!this.store) {
+      await this.cancelSession();
+      throw new Error("WITHDRAWAL_FAILED: Unable to locate user store");
+    }
+
+    await this.generateRef();
+
+    if (!otp) {
+      await this.cancelSession();
+      throw new Error(
+        "WITHDRAWAL_FAILED: OTP is required to withdraw to your account."
+      );
+    }
+
+    if (typeof amount !== "number") {
+      await this.cancelSession();
+      throw new Error("WITHDRAWAL_FAILED: Amount must be a number");
+    }
+
+    const accountService = new Account(this.storeId, this?.store.owner);
+
+    const { email = "" } = await accountService.getUser();
+
+    await accountService.verifyOTP({ email, token: otp });
+
+    const userHasPendingWithdrawal = await WithdrawalQueueModel.exists({
+      status: "pending",
+      storeId: this.storeId,
+    });
+
+    if (!!userHasPendingWithdrawal) {
+      await this.cancelSession();
+      throw new Error(
+        "WITHDRAWAL_FAILED: You have a pending withdrawal request. Please wait for it to be processed."
+      );
+    }
+
+    const { owner } = this.store;
+
+    const user = await UserModel.findById(owner);
+
+    //Get the account the user wants to withdraw to
+    const account = await StoreBankAccountModel.findById(accountId);
+
+    if (!account) {
+      await this.cancelSession();
+      throw new Error("WITHDRAWAL_FAILED: Unable to find your bank account.");
+    }
+
+    const { accountName, accountNumber, bankCode, bankName } = account;
+
+    this.transaction = {
+      ...this.transaction,
+      identifier: user._id.toString(),
+      paymentChannel: "balance",
+      txRef: this.ref,
+      type: "Transfer",
+      paymentMethod: "store-build-service",
+      storeId: this.store._id,
+      amount,
+    };
+
+    await this.createTransaction();
+
+    const withdrawQueue: IWithdrawalQueue = {
+      amount,
+      bankDetails: {
+        accountName,
+        accountNumber,
+        bankCode,
+        bankName,
+      },
+      status: "pending",
+      storeId: this.storeId,
+      userId: user._id.toString(),
+      validationPassed: true,
+      transactionReference: this.transaction.txRef,
+      processingDate: now,
+      notes: "User is requesting to withdraw from their store balance",
+    };
+
+    const withdrawalQueue = new WithdrawalQueueModel(withdrawQueue);
+
+    await withdrawalQueue.save({
+      session: this.session,
+      validateBeforeSave: true,
+    });
+
+    // Send withdrawal request notification email to store owner
+    sendEmail(
+      [user.email],
+      `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+      <h2>Withdrawal Request Notification</h2>
+      <p>Hello ${user.fullName},</p>
+      <p>A withdrawal request has been initiated from your store account with the following details:</p>
+      <ul>
+        <li>Amount: ${formatAmountToNaira(amount)}</li>
+        <li>Date: ${new Date().toLocaleString()}</li>
+        <li>Status: Pending</li>
+      </ul>
+      <p>You will receive another notification once the withdrawal has been processed.</p>
+      <p>If you did not initiate this withdrawal, please contact support immediately.</p>
+      <p>Best regards,<br/>StoreBuild Team</p>
+    </div>
+  `,
+      undefined,
+      "Withdrawal Request Notification"
+    );
+
+    //await this.creditStoreOwner(this.storeId, -amount);
+
+    //Check the user transaction history to check if there is a fraudlet activity and also check if the user is able to withdraw or in coolOff
+
+    await this.commitSession();
+
+    return this;
+  }
+
+  public async getInternalTransactions(payload: {
+    size?: number;
+    skip?: number;
+  }) {
+    try {
+      await this.startSession();
+
+      const transactions = await TransactionModel.find({
+        storeId: this.storeId,
+        $or: [{ type: "Funding" }, { type: "Transfer" }],
+      })
+        .sort({ createdAt: -1 })
+        .skip(payload?.skip || 0)
+        .limit(payload?.size || 5)
+        .lean()
+        .session(this.session);
+
+      const totalTransactions = await TransactionModel.countDocuments({
+        storeId: this.storeId,
+        $or: [{ type: "Funding" }, { type: "Transfer" }],
+      });
+
+      await this.commitSession();
+
+      return { transactions, totalTransactions };
+    } catch (err) {
+      await this.cancelSession();
+      throw err;
+    }
   }
 }
 
@@ -2075,6 +2287,8 @@ export class Account {
       throw new Error("Invalid OTP or OTP has already been used.");
     }
 
+    //const store = new Store(otp)
+
     // Check if OTP is expired
     if (Date.now() > otp.expiredAt) {
       await this.cancelSession();
@@ -2088,13 +2302,14 @@ export class Account {
 
     // Handle different OTP actions based on `tokenFor`
     if (otp.tokenFor === "login") {
-      const store = await StoreModel.findOne({ owner: user.id }).session(
-        this.session
-      );
+      const store = await StoreModel.findOne({
+        owner: user.id,
+        status: "active",
+      }).session(this.session);
 
       if (!store) {
         await this.cancelSession();
-        throw new Error("Store not found.");
+        throw new Error("Store not found or not active");
       }
 
       if (!user.isEmailVerified) {
@@ -2110,6 +2325,12 @@ export class Account {
       await this.commitSession();
       // Generate and return token for login
       return generateToken(user.id, user.email, store.id);
+    }
+
+    if (otp.tokenFor === "verify-email") {
+      user.isEmailVerified = true;
+      await otp.deleteOne({ session: this.session });
+      await this.commitSession();
     }
   }
 
@@ -2194,6 +2415,60 @@ export class Account {
     await user
       .updateOne({ $set: { ...userData }, validate: true })
       .session(this.session);
+  }
+
+  public async getStoreAccounts(
+    size = 5,
+    storeCode?: string,
+    getDefault = false
+  ) {
+    let _id;
+    if (storeCode) {
+      const store = await findStore({ storeCode }, true, { _id: 1 });
+      _id = store._id;
+    }
+
+    const bankAccounts = await StoreBankAccountModel.find({
+      storeId: _id,
+      ...(getDefault ? { isDefault: getDefault } : undefined),
+    }).limit(size);
+
+    // Mask account numbers before returning
+    const maskedAccounts = bankAccounts.map((account) => {
+      const accountObj = account.toObject();
+      if (accountObj.accountNumber) {
+        accountObj.accountNumber =
+          "*".repeat(accountObj.accountNumber.length - 4) +
+          accountObj.accountNumber.slice(-4);
+      }
+      return accountObj;
+    });
+
+    return maskedAccounts;
+  }
+
+  public async writeReviewOnProduct(payload: IRating) {
+    await findStore(this.storeId);
+
+    await findProduct(payload.productId);
+
+    const userCanWriteReview = await OrderModel.exists({
+      "customerDetails.email": payload.userEmail,
+      products: { $elemMatch: { _id: payload.productId } },
+      $or: [{ orderStatus: "Completed" }, { orderStatus: "Shipped" }],
+    });
+
+    if (!userCanWriteReview) {
+      throw new Error(
+        "UNABLE_TO_WRITE_REVIEW: You have not purchased this product, you can only write a review if you have purchased this product."
+      );
+    }
+
+    const newReview = new RatingModel(payload);
+
+    await newReview.save();
+
+    return newReview;
   }
 }
 
@@ -2309,11 +2584,10 @@ export class Product extends Account {
     }
   }
 
-  public async getProducts(filters: getProductFilters) {
+  public async getProducts(filters: getProductFilters, isAdmin = true) {
     const {
       q,
       category,
-      isActive,
       colors,
       size = 0,
       gender,
@@ -2325,7 +2599,10 @@ export class Product extends Account {
       sizes,
     } = filters;
 
-    let matchStage: any = { storeId: this.storeId, isActive: true };
+    let matchStage: any = {
+      storeId: this.storeId,
+      ...(isAdmin ? {} : { isActive: true }),
+    };
 
     // Text search filter
     if (q) {
@@ -2338,7 +2615,6 @@ export class Product extends Account {
 
     // Basic filters
     if (category) matchStage.category = category;
-    if (typeof isActive === "boolean") matchStage.isActive = isActive;
 
     // Color filter
     if (colors && colors.length > 0) {
@@ -2533,6 +2809,14 @@ export class Product extends Account {
   public async deleteProduct(productId: string) {
     await ProductModel.findByIdAndDelete(productId);
   }
+
+  public async getProductsWithStoreCode(storeCode: string) {
+    const { _id: storeId } = await findStore({ storeCode }, true, { _id: 1 });
+
+    const products = await ProductModel.find({ storeId });
+
+    return products;
+  }
 }
 
 export class Store extends Account {
@@ -2570,7 +2854,7 @@ export class Store extends Account {
             },
           ],
           showFeatures: true,
-          style: "one",
+          style: "two",
         },
         footer: {
           style: "one",
@@ -2603,8 +2887,10 @@ export class Store extends Account {
       status: "active",
       storeCode: generateRandomString(6),
       storeName: props.storeName,
-      templateId: "",
+      templateId: generateRandomString(18),
       balance: 0,
+      lockedBalance: 0,
+      pendingBalance: 0,
     };
 
     const store = new StoreModel(payload);
@@ -2710,20 +2996,19 @@ export class Store extends Account {
   public async previewStore(storeCode?: string) {
     //This is use to preview the store for the admin only.
 
-    const store = await StoreModel.findOne({
-      $or: [{ storeCode }, { _id: this.storeId }],
-    });
+    //Getting the store with the store code or the store id
+    const store = await StoreModel.findOne({ storeCode });
+
+    if (!store) {
+      return { action: "not-found" };
+    }
 
     //This means that the admin wants to preview their store
-    if (storeCode && this.userId) {
-      if (store.owner !== this.userId) {
-        return { action: "unauthorize" };
-      }
-
+    if (!!this.userId) {
       const now = new Date();
-      const previewMinute = new Date(store.previewFor);
+      const previewMinute = new Date(store?.previewFor);
 
-      if (now > previewMinute) {
+      if (!store.previewFor || now > previewMinute) {
         return { action: "expired" };
       }
 
@@ -2736,9 +3021,36 @@ export class Store extends Account {
 
     return { store, action: "preview" };
   }
+
+  public async editStore(updates: Partial<IStore>, partial = true) {
+    //await this.isStoreActive(true);
+
+    if (updates?.customizations?.category?.showImage) {
+      const categories = await CategoryModel.find({
+        storeId: this.storeId,
+      });
+      const allCategoriesHaveImages = categories.every(
+        (category) => !!category.img
+      );
+
+      if (!allCategoriesHaveImages) {
+        throw new Error(
+          "All categories must have images when showImage is enabled."
+        );
+      }
+    }
+
+    return await StoreModel.findOneAndUpdate(
+      { _id: this.storeId, owner: this.userId },
+      partial ? { $set: updates } : updates,
+      { runValidators: true, new: true }
+    ).lean();
+  }
 }
 
 export class Order extends Store {
+  order: IOrder;
+
   constructor(storeId?: string, userId?: string) {
     super(storeId, userId);
   }
@@ -3058,6 +3370,7 @@ export class Order extends Store {
       throw new Error("ORDER_QUERY_FAILED: unable to locate your order");
     }
 
+    this.order = order;
     this.storeId = order.storeId;
 
     await this.commitSession();
@@ -3071,37 +3384,117 @@ export class Order extends Store {
     updates: Partial<IOrder>,
     isAdmin = false
   ) {
-    if (!isAdmin) {
-      const restrictedKeys = new Set([
-        "orderStatus",
-        "paymentDetails",
-        "paymentStatus",
-        "createdAt",
-        "updatedAt",
-        "shippingDetails",
-        "totalAmount",
-        "storeId",
-        "amountLeftToPay",
-        "amountPaid",
-        "coupon",
-      ]);
+    const query = isAdmin
+      ? { _id: orderId, storeId: this.storeId }
+      : { _id: orderId, "customerDetails.phoneNumber": phoneNumber };
 
-      const updateKeys = Object.keys(updates);
+    const restrictedKeys = new Set([
+      "orderStatus",
+      "paymentDetails",
+      "paymentStatus",
+      "createdAt",
+      "updatedAt",
+      "shippingDetails",
+      "totalAmount",
+      "storeId",
+      "amountLeftToPay",
+      "amountPaid",
+      "coupon",
+    ]);
 
-      for (const updateKey of updateKeys) {
-        if (!restrictedKeys.has(updateKey)) {
-          throw new Error(
-            "UNAUTHORIZE_ACTION: You are not allow to modify/configure this properties"
-          );
-        }
+    const updateKeys = Object.keys(updates);
+
+    for (const updateKey of updateKeys) {
+      if (!isAdmin && restrictedKeys.has(updateKey)) {
+        throw new Error(
+          "UNAUTHORIZE_ACTION: You are not allow to modify/configure this properties"
+        );
       }
+    }
 
-      await OrderModel.findOneAndUpdate(
-        { _id: orderId, "customerDetails.phoneNumber": phoneNumber },
-        {
-          $set: { ...updates },
-        }
+    const order = await OrderModel.findOne(query).session(this.session);
+
+    if (isAdmin && order.storeId !== this.storeId) {
+      await this.cancelSession();
+      throw new Error(
+        "UNAUTHORIZED_ACTION: You are not allow to perform this action."
       );
     }
+
+    if (!order) {
+      await this.cancelSession();
+      throw new Error("ORDER_QUERY_FAILED: unable to locate your order");
+    }
+
+    Object.assign(order, updates);
+
+    await order.save({ validateBeforeSave: true, session: this.session });
+
+    return order;
+  }
+
+  isOperationAllowed() {
+    if (this.order?.orderStatus === "Completed") {
+      throw new Error("ORDER_UPDATE_FAILED: Order has been completed");
+    }
+
+    if (this.order?.orderStatus === "Cancelled") {
+      throw new Error("ORDER_UPDATE_FAILED: Order has been cancelled");
+    }
+
+    if (this.order.orderStatus === "Shipped") {
+      throw new Error("ORDER_UPDATE_FAILED: Order has been shipped");
+    }
+
+    if (this.order.orderStatus === "Refunded") {
+      throw new Error("ORDER_UPDATE_FAILED: Order has been refunded");
+    }
+  }
+
+  async requestCancellation(
+    orderId: string,
+    phoneNumber: string,
+    cancellationReason?: string
+  ) {
+    await this.getOrder(orderId, phoneNumber);
+
+    this.isOperationAllowed();
+
+    await this.getStore();
+
+    const { email } = await this.getUser(this.store.owner);
+
+    await sendEmail(
+      email,
+      `
+        <div>
+          <h2>Order Cancellation Request</h2>
+          <p>Dear Store Owner,</p>
+          <p>A customer has requested to cancel their order. Please review the details below:</p>
+          <p>Order ID: ${orderId}</p>
+          <p>You can review and process this cancellation request by clicking the button below:</p>
+          <p>Reason: ${cancellationReason}</p>
+          <a href="${config.CLIENT_DOMAIN}/dashboard-orders/${orderId}" style="
+            background-color: #4CAF50;
+            border: none;
+            color: white;
+            padding: 15px 32px;
+            text-align: center;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 16px;
+            margin: 4px 2px;
+            cursor: pointer;
+            border-radius: 4px;
+          ">
+            View Order Details
+          </a>
+          <p>Please handle this request as soon as possible to ensure customer satisfaction.</p>
+          <p>Best regards,<br>StoreBuild Team</p>
+        </div>
+      `,
+      undefined,
+      "Order Cancellation Request"
+    );
   }
 }

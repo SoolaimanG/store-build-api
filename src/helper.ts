@@ -29,6 +29,7 @@ import {
   VerifyChargeResponse,
 } from "./types";
 import {
+  AISuggestionModel,
   CategoryModel,
   ChatBotConversationModel,
   Coupon,
@@ -43,6 +44,7 @@ import {
   ReferralModel,
   StoreModel,
   StoreSttings,
+  TransactionModel,
   UserModel,
 } from "./models";
 import { Request, Response, NextFunction } from "express";
@@ -142,7 +144,7 @@ export const httpStatusResponse = (
     },
   };
 
-  const checkCode = Object.keys(status).includes(code + "");
+  const checkCode = new Set(Object.keys(status)).has(code + "");
 
   return checkCode ? status[code] : { status: _status, message, code, data };
 };
@@ -565,11 +567,11 @@ export const calculateMetrics = async (
 
   const currentOrders = await OrderModel.find({
     ...filter,
-    orderStatus: "Paid",
+    orderStatus: "Completed",
   });
   const prevOrders = await OrderModel.find({
     ...prevFilter,
-    orderStatus: "Paid",
+    orderStatus: "Completed",
   });
 
   const totalSales = currentOrders.reduce(
@@ -869,14 +871,6 @@ export async function createCharge({
   }
 }
 
-export const allowOrderStatus = (
-  orderStatus: IOrderStatus,
-  _allowOrderStatus: IOrderStatus[] = ["Pending", "Processing"]
-) => {
-  if (!_allowOrderStatus.includes(orderStatus))
-    throw new Error(`Cannot send a request with this order`);
-};
-
 export const calculateTotalAmount = async (
   cartItems: { productId: string; color?: string; size?: string }[],
   couponCode?: string
@@ -1063,6 +1057,15 @@ export const sendQuickEmail = async (
     undefined,
     label
   );
+};
+
+export const maskAccountNumber = (accountNumber: string): string => {
+  if (!accountNumber) return "";
+
+  const lastFourDigits = accountNumber.slice(-4);
+  const maskedPortion = "*".repeat(accountNumber.length - 4);
+
+  return maskedPortion + lastFourDigits;
 };
 
 export const _editOrder = async (
@@ -3004,6 +3007,8 @@ export class StoreBuildAI extends Store {
     return `
   You are an AI assistant specialized in e-commerce and store management. Your role is to assist with customer services like sending messages to support, tracking orders, comparing products, and making inquiries about products. Always maintain a professional, concise, and helpful tone.
   
+  Your name is Store Build AI
+  
   Guidelines:
   1. Focus on Store-Related Tasks:
      - You are restricted to answering questions and handling tasks related to this specific store.
@@ -3268,6 +3273,235 @@ export class StoreBuildAI extends Store {
         "RATE_LIMIT_EXCEEDED: This bot only accepts two messages per minute"
       );
     }
+  }
+
+  async aiSuggestions() {
+    const now = new Date();
+
+    const user = await UserModel.findById(this.userId);
+
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    const { expiredAt, type } = user?.plan || {};
+
+    const expire = new Date(expiredAt);
+
+    if (now > expire) {
+      user.plan = {
+        ...user.plan,
+        type: "free",
+      };
+
+      await user.save({ validateModifiedOnly: true });
+
+      throw new Error("Your subscription has expired");
+    }
+
+    const suggestions = await AISuggestionModel.find({
+      storeId: this.storeId,
+      createdAt: { $gte: new Date().setHours(0, 0, 0, 0) },
+    }).lean();
+
+    if (!!suggestions.length) {
+      console.log("Requested");
+      return suggestions;
+    }
+
+    const store = await StoreModel.findOne(
+      {
+        owner: this.userId,
+      },
+      { _id: 1 }
+    );
+
+    const storeProducts = await ProductModel.find({
+      storeId: store?._id,
+    });
+
+    const storeOrders = await OrderModel.find({
+      storeId: store?._id,
+    });
+
+    const storeTransactions = await TransactionModel.find({
+      storeId: store?._id,
+      paymentFor: "order",
+      paymentChannel: "flutterwave",
+      type: "Payment",
+    });
+
+    // Calculate key metrics
+    const totalProducts = storeProducts.length;
+    const totalOrders = storeOrders.length;
+    const totalRevenue = storeTransactions.reduce(
+      (sum, transaction) => sum + (transaction.amount || 0),
+      0
+    );
+
+    // Get product categories and their performance
+    const productCategories: Record<string, any> = {};
+    storeProducts.forEach((product) => {
+      const category = product.category || "Uncategorized";
+      if (!productCategories[category]) {
+        productCategories[category] = {
+          count: 0,
+          revenue: 0,
+          orders: 0,
+        };
+      }
+      productCategories[category].count++;
+    });
+
+    // Get top selling products
+    const productSales = storeProducts
+      .map((product) => {
+        const productOrders = storeOrders.filter((order) =>
+          order.products?.some(
+            (item) => item._id?.toString() === product._id?.toString()
+          )
+        );
+
+        const totalSold = productOrders.reduce((sum, order) => {
+          const item = order.products?.find(
+            (item) => item._id?.toString() === product._id?.toString()
+          );
+          return sum + (item?.quantity || 0);
+        }, 0);
+
+        // Update category revenue and orders
+        const category = product.category || "Uncategorized";
+        if (productCategories[category]) {
+          productCategories[category].revenue +=
+            totalSold * (product.price.default || 0);
+          productCategories[category].orders += totalSold;
+        }
+
+        return {
+          productId: product._id,
+          name: product.productName,
+          category: product.category || "Uncategorized",
+          totalSold,
+          revenue: totalSold * (product.price.default || 0),
+        };
+      })
+      .sort((a, b) => b.totalSold - a.totalSold);
+
+    const topProducts = productSales.slice(0, 5);
+
+    // Get order status distribution
+    const orderStatusCounts: Record<string, any> = {};
+    storeOrders.forEach((order) => {
+      const status = order.orderStatus || "Pending";
+      orderStatusCounts[status] = (orderStatusCounts[status] || 0) + 1;
+    });
+
+    // Get recent sales trend (last 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const recentOrders = storeOrders.filter(
+      (order) => new Date(order.createdAt) >= thirtyDaysAgo
+    );
+
+    const dailySales: Record<string, any> = {};
+    recentOrders.forEach((order) => {
+      const date = new Date(order.createdAt).toISOString().split("T")[0];
+      dailySales[date] = (dailySales[date] || 0) + 1;
+    });
+
+    // Format the data for the prompt
+    const salesTrend = Object.entries(dailySales)
+      .map(([date, count]) => `${date}: ${count} orders`)
+      .join("\n");
+
+    const topProductsList = topProducts
+      .map(
+        (product, index) =>
+          `${index + 1}. ${product.name} (${product.category}): ${
+            product.totalSold
+          } units sold, Revenue: ${product.revenue}`
+      )
+      .join("\n");
+
+    const categoryAnalysis = Object.entries(productCategories)
+      .map(
+        ([category, data]) =>
+          `${category}: ${data.count} products, ${data.orders} orders, Revenue: ${data.revenue}`
+      )
+      .join("\n");
+
+    const orderStatusAnalysis = Object.entries(orderStatusCounts)
+      .map(([status, count]) => `${status}: ${count} orders`)
+      .join("\n");
+
+    const instructions = `
+   You are a business analytics expert providing insights and suggestions for an e-commerce store owner.
+   
+   Below are the data of a user online store, help analyze and suggest improvements.
+   
+   STORE ANALYTICS:
+   - Total Products: ${totalProducts}
+   - Total Orders: ${totalOrders}
+   - Total Revenue: ${totalRevenue}
+   
+   CATEGORY ANALYSIS:
+   ${categoryAnalysis}
+   
+   TOP SELLING PRODUCTS:
+   ${topProductsList}
+   
+   ORDER STATUS DISTRIBUTION:
+   ${orderStatusAnalysis}
+   
+   RECENT SALES TREND (LAST 30 DAYS):
+   ${salesTrend}
+   
+   Based on this data, generate EXACTLY 3 business suggestions in the following JSON format:
+   [
+     {
+       "title": "Short, actionable title for the suggestion",
+       "description": "Detailed explanation with specific insights from the data",
+       "action": "Call-to-action button text"
+     },
+     ...
+   ]
+   
+   Each suggestion should:
+   1. Be based on actual patterns in the data
+   2. Include specific references to products, categories, or metrics
+   3. Provide actionable advice the store owner can implement
+   4. Have a relevant action button text that makes sense for the suggestion
+   
+   IMPORTANT: Return ONLY the JSON array with exactly 3 suggestions. No introduction, explanation or other text.
+   
+   Do not ask the user questions just suggest improve to the user online store
+ `;
+
+    this.systemPrompt = instructions;
+
+    const chatSession = this.model.startChat({
+      generationConfig: {
+        temperature: 1,
+        topP: 0.95,
+        topK: 40,
+        maxOutputTokens: 1000,
+        responseMimeType: "application/json",
+      },
+    });
+
+    const result = await chatSession.sendMessage(this.systemPrompt);
+    const response = result.response.text();
+
+    //@ts-ignore
+    const r = JSON.parse(response).map((res) => ({
+      ...res,
+      storeId: this.storeId,
+    }));
+
+    const _suggestions = await AISuggestionModel.insertMany(r);
+
+    return _suggestions;
   }
 }
 

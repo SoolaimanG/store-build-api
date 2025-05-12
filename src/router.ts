@@ -28,7 +28,6 @@ import {
   editCategory,
   editDeliveryAddress,
   editOrder,
-  editOrderForCustomer,
   editStore,
   exportCustomerData,
   getAiConversation,
@@ -80,6 +79,9 @@ import {
   welcomeHome,
   writeReviewOnProdcut,
   subscribeForStoreBuildAI,
+  withdraw,
+  getInternalTransaction,
+  getAiSuggestions,
 } from "./controllers";
 import {
   checkIfUserIsAuthenticated,
@@ -195,6 +197,8 @@ router.get(
 router.get("/get-products/:productId/", getProduct);
 
 router.get("/get-quick-emails/", checkIfUserIsAuthenticated, getQuickEmails);
+
+router.post("/request-withdraw/", checkIfUserIsAuthenticated, withdraw);
 
 router.post(
   "/send-quick-email/:emailId/",
@@ -330,8 +334,6 @@ router.post(
   aiStoreAssistant
 );
 
-router.patch("/edit-order-for-customer/:orderId/", editOrderForCustomer);
-
 router.get(
   `/get-onboarding-flow/`,
   checkIfUserIsAuthenticated,
@@ -385,6 +387,14 @@ router.post(
   checkIfUserIsAuthenticated,
   subscribeForStoreBuildAI
 );
+
+router.get(
+  "/get-internal-transaction/",
+  checkIfUserIsAuthenticated,
+  getInternalTransaction
+);
+
+router.get(`/get-ai-suggestion/`, checkIfUserIsAuthenticated, getAiSuggestions);
 
 router.get("/", welcomeHome);
 

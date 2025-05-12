@@ -1,5 +1,6 @@
 import mongoose, { Document, mongo } from "mongoose";
 import {
+  IAiSuggestion,
   ICategory,
   IChatBotConversation,
   ICustomerAddress,
@@ -25,6 +26,7 @@ import {
   ITransaction,
   ITutorial,
   IUser,
+  IWithdrawalQueue,
   Metadata,
   PATHS,
 } from "./types";
@@ -498,6 +500,8 @@ export const StoreSchema: mongoose.Schema<IStore> = new mongoose.Schema(
         display: { type: String, enum: ["grid", "flex"] },
       },
     ],
+    pendingBalance: { type: Number, default: 0, select: false },
+    lockedBalance: { type: Number, default: 0, select: false },
   },
   {
     timestamps: true,
@@ -509,7 +513,7 @@ export const OtpSchema = new mongoose.Schema<IOTP>(
     token: { type: String, required: true },
     tokenFor: {
       type: String,
-      enum: ["login", "verify-email"],
+      enum: ["login", "verify-email", "withdraw"],
       default: "login",
     },
     user: { type: String, required: true },
@@ -604,14 +608,14 @@ const ShippingDetailsSchema = new mongoose.Schema({
   estimatedDeliveryDate: {
     type: String,
     default: new Date(Date.now() + 60 * 60 * 24 * 5 * 1000).toISOString(),
-    validate: {
-      validator(date: string) {
-        const today = new Date();
-        const estimatedDeliveryDate = new Date(date);
-
-        return estimatedDeliveryDate > today;
-      },
-    },
+    //    validate: {
+    //      validator(date: string) {
+    //        const today = new Date();
+    //        const estimatedDeliveryDate = new Date(date);
+    //
+    //        return estimatedDeliveryDate > today;
+    //      },
+    //    },
   },
   trackingNumber: { type: String },
   carrier: { type: String, default: "SENDBOX" },
@@ -887,6 +891,7 @@ CouponSchema.index({ couponCode: 1 }, { unique: true, sparse: true });
 
 OrderSchema.pre("save", async function (next) {
   try {
+    const now = new Date();
     const prev = await OrderModel.findById(this._id);
 
     if (prev && prev?.orderStatus === "Completed") {
@@ -910,17 +915,22 @@ OrderSchema.pre("save", async function (next) {
 
       this.paymentDetails.paymentStatus = "paid";
       this.paymentDetails.paymentDate = this.updatedAt;
+      this.orderStatus = "Completed";
 
       const amountForSize = (product: IProduct, _size: string) => {
-        return product.price.sizes.find((size) => size)[_size];
+        return product?.price?.sizes?.find((size) => size)?.[_size];
       };
+
+      now.setDate(now.getDate() + 5);
 
       const emailPayload = {
         companyLogo: store.customizations.logoUrl,
         companyName: store.storeName,
         customerEmail: this.customerDetails.email,
         customerName: this.customerDetails.name,
-        estimatedDelivery: this.shippingDetails.estimatedDeliveryDate,
+        estimatedDelivery: new Date(
+          this?.shippingDetails?.estimatedDeliveryDate || now.toISOString()
+        ).toISOString(),
         items: this.products.map((product) => ({
           name: product.productName,
           price:
@@ -937,7 +947,7 @@ OrderSchema.pre("save", async function (next) {
           street: this.customerDetails.shippingAddress.addressLine1,
           zipCode: this.customerDetails.shippingAddress.postalCode,
         },
-        shippingMethod: this.shippingDetails.shippingMethod,
+        shippingMethod: this.shippingDetails?.shippingMethod || "STANDARD",
         supportEmail,
         supportPhone,
         total: this.totalAmount,
@@ -946,7 +956,7 @@ OrderSchema.pre("save", async function (next) {
       const orderCompletionEmail = generateOrderCompletionEmail(emailPayload);
 
       //Notify the customer about this order
-      await sendEmail(
+      sendEmail(
         this.customerDetails.email,
         orderCompletionEmail,
         undefined,
@@ -961,70 +971,75 @@ OrderSchema.pre("save", async function (next) {
 });
 
 OrderSchema.post("save", async function (order) {
-  if (!this.isNew) return;
+  try {
+    if (!this.isNew) return;
 
-  // Send an email notification to user on order --> If the paystack isConnected -> True
-  const store = await StoreModel.findById(order.storeId).select(
-    "+paymentDetails"
-  );
+    // Send an email notification to user on order --> If the paystack isConnected -> True
+    // Fetch all required data in parallel at the start
+    const [store, integration, bank] = await Promise.all([
+      StoreModel.findById(order.storeId),
+      IntegrationModel.findOne({
+        storeId: order.storeId,
+        "integration.name": "paystack",
+      }),
 
-  const [integration, user] = await Promise.all([
-    IntegrationModel.findOne({
-      storeId: store._id,
-      "integration.name": "paystack",
-    }),
-    findUser(store.owner),
-  ]);
+      StoreBankAccountModel.findOne({
+        storeId: order.storeId,
+        isDefault: true,
+      }),
+    ]);
 
-  let email;
+    const user = await findUser(store.owner);
 
-  const { products: items, totalAmount, _id: orderNumber } = order;
+    const { products: items, totalAmount, _id: orderNumber } = order;
+    const viewOrderLink = PATHS.STORE_ORDERS + order._id;
+    const customerName = order.customerDetails.name;
 
-  if (integration.integration.isConnected) {
-    // send the user an email that have payment information with the payment link.
-    email = generateOrderEmailWithPaymentLink({
+    // Prepare email content based on integration status
+    const email = integration.integration.isConnected
+      ? generateOrderEmailWithPaymentLink({
+          items,
+          totalAmount,
+          viewOrderLink,
+          userName: customerName,
+          orderNumber,
+          paymentLink: order.paymentDetails.paymentLink,
+        })
+      : generateManualPaymentEmail({
+          items,
+          totalAmount,
+          viewOrderLink,
+          userName: customerName,
+          orderNumber,
+          paymentDetails: {
+            accountName: bank.accountName,
+            accountNumber: bank.accountNumber,
+            bankName: bank.bankName,
+          },
+        });
+
+    const adminEmail = generateAdminOrderNotificationEmail({
       items,
       totalAmount,
-      viewOrderLink: PATHS.STORE_ORDERS + order._id,
-      userName: order.customerDetails.name,
+      viewOrderLink,
+      adminName: user.fullName,
       orderNumber,
-      paymentLink: order.paymentDetails.paymentLink,
+      customerName,
     });
-  } else {
-    email = generateManualPaymentEmail({
-      items,
-      totalAmount,
-      viewOrderLink:
-        config.CLIENT_DOMAIN +
-        `/store/${store.storeCode}/track-order/` +
-        order._id,
-      userName: order.customerDetails.name,
-      orderNumber,
-      // TODO
-      paymentDetails: { accountName: "", accountNumber: "", bankName: "" },
-    });
+
+    // Send emails in parallel
+    await Promise.all([
+      sendEmail(
+        order.customerDetails.email,
+        email,
+        undefined,
+        "Order Received Successfully"
+      ),
+      sendEmail(user.email, adminEmail, undefined, "New Order Received!"),
+    ]);
+  } catch (err) {
+    console.log(err);
   }
-
-  // Use the default user payment information to display to user, This means that the payment will be manually
-
-  const adminEmail = generateAdminOrderNotificationEmail({
-    items,
-    totalAmount,
-    viewOrderLink: PATHS.STORE_ORDERS + order._id,
-    adminName: user.fullName,
-    orderNumber,
-    customerName: order.customerDetails.name,
-  });
-
-  await Promise.all([
-    sendEmail(
-      order.customerDetails.email,
-      email,
-      undefined,
-      "Order Recieved Successfully"
-    ),
-    sendEmail(user.email, adminEmail, undefined, "New Order Received!"),
-  ]);
 });
 
 StoreSchema.pre("save", async function (next) {
@@ -1423,10 +1438,122 @@ const StoreBankAccountSchema: mongoose.Schema<IStoreBankAccounts> =
         type: String,
         trim: true,
         unique: true,
+        select: false,
       },
     },
     { timestamps: true }
   );
+
+const WithdrawalQueueSchema: mongoose.Schema<IWithdrawalQueue> =
+  new mongoose.Schema(
+    {
+      amount: {
+        type: Number,
+        required: [true, "Withdrawal amount is required"],
+        min: [1000, "Minimum withdrawal amount is ₦1,000"],
+        validate: {
+          validator: function (amount: number) {
+            return amount % 100 === 0; // Amount must be in multiples of 100
+          },
+          message: "Amount must be in multiples of ₦100",
+        },
+      },
+      status: {
+        type: String,
+        enum: ["pending", "processing", "completed", "failed"],
+        default: "pending",
+      },
+      storeId: {
+        type: String,
+        required: true,
+        validate: {
+          validator: async function (storeId: string) {
+            const store = await StoreModel.findById(storeId);
+            return !!store;
+          },
+          message: "Store does not exist",
+        },
+      },
+      bankDetails: {
+        accountName: { type: String, required: true },
+        accountNumber: {
+          type: String,
+          required: true,
+          validate: {
+            validator: function (num: string) {
+              return /^\d{10}$/.test(num); // Must be exactly 10 digits
+            },
+            message: "Invalid account number format",
+          },
+        },
+        bankName: { type: String, required: true },
+      },
+      transactionReference: {
+        type: String,
+        unique: true,
+        required: true,
+        validate: {
+          validator: function (ref: string) {
+            return mongoose.Types.ObjectId.isValid(ref);
+          },
+          message: "Invalid transaction reference format",
+        },
+      },
+      processingDate: {
+        type: Date,
+        default: Date.now,
+      },
+      validationPassed: {
+        type: Boolean,
+        default: false,
+      },
+      validationErrors: {
+        type: [String],
+        default: [],
+      },
+      userAgent: {
+        type: String,
+      },
+      failureReason: {
+        type: String,
+      },
+      ipAddress: {
+        type: String,
+      },
+    },
+    {
+      timestamps: true,
+    }
+  );
+
+// Add index for faster queries
+WithdrawalQueueSchema.index({ storeId: 1, status: 1 });
+
+// Pre-save hook to validate withdrawal amount against store balance
+WithdrawalQueueSchema.pre("save", async function (next) {
+  if (this.isNew) {
+    const store = await StoreModel.findById(this.storeId).select("+balance");
+
+    const balance =
+      store?.balance - (store?.pendingBalance + store?.lockedBalance);
+
+    if (!store || balance < this.amount) {
+      throw new Error(
+        "WITHDRAWAL_FAILED: Insufficient store balance for withdrawal"
+      );
+    }
+  }
+  next();
+});
+
+const aiSuggestionsSchema: mongoose.Schema<IAiSuggestion> = new mongoose.Schema(
+  {
+    action: { type: String },
+    description: { type: String },
+    title: { type: String },
+    storeId: { type: String, required: true },
+  }
+);
 
 const DedicatedAccountSchema: mongoose.Schema<IDedicatedAccount> =
   new mongoose.Schema({
@@ -1463,6 +1590,10 @@ export const StoreBankAccountModel = mongoose.model(
   "storebankaccount",
   StoreBankAccountSchema
 );
+export const AISuggestionModel = mongoose.model(
+  "aiSuggestion",
+  aiSuggestionsSchema
+);
 export const TutorialModel = mongoose.model("tutorial", TutorialSchema);
 export const AddressModel = mongoose.model("address", AddressSchema);
 export const CategoryModel = mongoose.model("category", CategorySchema);
@@ -1483,7 +1614,9 @@ export const IntegrationModel = mongoose.model(
   "integration",
   IntegrationSchema
 );
+
 export const Coupon = mongoose.model<ICoupon>("Coupon", CouponSchema);
+
 export const ProductTypesModel = mongoose.model(
   "productType",
   ProductTypeSchema
@@ -1495,4 +1628,8 @@ export const TransactionModel = mongoose.model(
 export const DedicatedAccountModel = mongoose.model(
   "dedicatedAccount",
   DedicatedAccountSchema
+);
+export const WithdrawalQueueModel = mongoose.model(
+  "withdrawalQueue",
+  WithdrawalQueueSchema
 );
