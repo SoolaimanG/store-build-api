@@ -490,9 +490,7 @@ export class PaymentService {
         query.$or.push({ _id: new mongoose.Types.ObjectId(this.storeId) });
       }
 
-      store = await StoreModel.findOne(query).select(
-        payload?.select || undefined
-      );
+      store = await StoreModel.findOne(query).select(payload?.select);
 
       if (!store) {
         throw new Error("Store not found");
@@ -1567,16 +1565,15 @@ export class PaymentService {
 
     await this.generateRef();
 
-    const store = await this.getStore({ select: "+ balance" });
+    await this.getStore({ select: "+balance" });
 
-    if (!store) {
+    if (!this.store) {
       await this.cancelSession();
       throw new Error("PAYMENT_ERROR: Unable to locate your store");
     }
 
     if (!this.store.balance) {
-      await this.cancelSession();
-      throw new Error("PAYMENT_ERROR: Unable to locate your store balance");
+      this.store.balance = 0;
     }
 
     const { email, fullName } = await UserModel.findById(this.store.owner, {
@@ -2321,6 +2318,7 @@ export class Account {
       }
 
       await otp.deleteOne({ session: this.session });
+      await user.save({ validateBeforeSave: true, session: this.session });
 
       await this.commitSession();
       // Generate and return token for login
@@ -2329,6 +2327,7 @@ export class Account {
 
     if (otp.tokenFor === "verify-email") {
       user.isEmailVerified = true;
+      await user.save({ validateBeforeSave: true, session: this.session });
       await otp.deleteOne({ session: this.session });
       await this.commitSession();
     }
@@ -2342,6 +2341,12 @@ export class Account {
     tokenFor: IOTPFor;
     storeName?: string;
   }) {
+    const availableTokenFor = new Set(["login", "verify-email", "withdraw"]);
+
+    if (!availableTokenFor.has(props.tokenFor)) {
+      throw new Error("Invalid tokenFor value.");
+    }
+
     let token = generateOTP();
 
     await this.startSession();

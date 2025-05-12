@@ -557,21 +557,21 @@ export const calculateMetrics = async (
     prevStartDate.setDate(prevEndDate.getDate() - 30);
   }
 
-  const filter: any = startDate
-    ? { createdAt: { $gte: startDate }, storeId }
-    : {};
+  const filter: any = startDate ? { createdAt: { $gte: startDate } } : {};
   const prevFilter: any =
     prevStartDate && prevEndDate
-      ? { createdAt: { $gte: prevStartDate, $lt: prevEndDate }, storeId }
+      ? { createdAt: { $gte: prevStartDate, $lt: prevEndDate } }
       : {};
 
   const currentOrders = await OrderModel.find({
     ...filter,
     orderStatus: "Completed",
+    storeId,
   });
   const prevOrders = await OrderModel.find({
     ...prevFilter,
     orderStatus: "Completed",
+    storeId,
   });
 
   const totalSales = currentOrders.reduce(
@@ -1422,7 +1422,7 @@ export const handleIntegrationConnection = async (
         shippingRegions: [],
         deliveryNationwide: true,
       },
-      paystack: {
+      flutterwave: {
         chargeCustomers: false,
         storeName: store.storeName,
         storePhoneNumber: phoneNumber,

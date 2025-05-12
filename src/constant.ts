@@ -71,7 +71,7 @@ export const iconList = [
 
 export const integrationIds = [
   "unsplash",
-  "paystack",
+  "flutterwave",
   "chatbot",
   "sendbox",
   "instagram",

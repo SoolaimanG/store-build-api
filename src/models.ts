@@ -1240,7 +1240,10 @@ IntegrationSchema.pre("save", async function (next) {
       new Date(this?.integration?.subcription?.end_date) > now;
 
     if (premiumIntegrations.has(integrationId)) {
-      if (!isConnected && !activeSubscriptions) {
+      if (
+        (!isConnected && !activeSubscriptions) ||
+        !this?.integration?.subcription?.end_date
+      ) {
         next(
           new Error(
             "CANNOT_CONNECT_INTEGRATION: Please subscription to this integration before you can connect it to your store."
